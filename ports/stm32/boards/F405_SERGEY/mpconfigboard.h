@@ -84,3 +84,17 @@
 
 // MMA accelerometer config
 //#define MICROPY_HW_MMA_AVDD_PIN     (pin_B5)
+
+
+
+// Reconfiguring. Disabling MSC, enabling CDC and LittleFS V2.
+
+#define MICROPY_HW_USB_CDC (1)   // Enable USB serial REPL
+#define MICROPY_HW_USB_MSC (0)   // Disable USB mass storage
+
+//#define MICROPY_VFS_LFS2         (1)   // Enable LittleFS v2
+//#undef  MICROPY_VFS_FAT                // Disable FAT filesystem
+//#define MICROPY_VFS_FAT          (0)   // Disable FAT filesystem
+#define MICROPY_FSUSERMOUNT      (1)   // Allow mounting user-defined block devices
+#define MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE (1)
+
