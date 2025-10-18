@@ -11,6 +11,17 @@
 #define MICROPY_HW_ENABLE_USB       (1)
 #define MICROPY_HW_ENABLE_SDCARD    (0)
 
+// SPIFLASH config.
+#define MICROPY_HW_SPIFLASH_CS   (pin_B12)
+#define MICROPY_HW_SPIFLASH_SCK  (pin_B13)
+#define MICROPY_HW_SPIFLASH_MOSI (pin_C3)
+#define MICROPY_HW_SPIFLASH_MISO (pin_C2)
+#define MICROPY_HW_SPIFLASH_BUS  (2) // SPI2
+
+// Block device config
+#define MICROPY_HW_BDEV_SPIFLASH_CONFIG (&spiflash_config)
+extern const struct _mp_spiflash_config_t spiflash_config;
+
 // HSE is 8MHz
 #define MICROPY_HW_CLK_PLLM (8)
 #define MICROPY_HW_CLK_PLLN (336)
@@ -84,3 +95,5 @@
 
 // MMA accelerometer config
 //#define MICROPY_HW_MMA_AVDD_PIN     (pin_B5)
+
+
