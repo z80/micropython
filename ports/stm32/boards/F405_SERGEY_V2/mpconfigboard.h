@@ -11,17 +11,6 @@
 #define MICROPY_HW_ENABLE_USB       (1)
 #define MICROPY_HW_ENABLE_SDCARD    (0)
 
-// SPIFLASH config.
-#define MICROPY_HW_SPIFLASH_CS   (pin_B12)
-#define MICROPY_HW_SPIFLASH_SCK  (pin_B13)
-#define MICROPY_HW_SPIFLASH_MOSI (pin_C3)
-#define MICROPY_HW_SPIFLASH_MISO (pin_C2)
-#define MICROPY_HW_SPIFLASH_BUS  (2) // SPI2
-
-// Block device config
-#define MICROPY_HW_BDEV_SPIFLASH_CONFIG (&spiflash_config)
-extern const struct _mp_spiflash_config_t spiflash_config;
-
 // HSE is 8MHz
 #define MICROPY_HW_CLK_PLLM (8)
 #define MICROPY_HW_CLK_PLLN (336)
@@ -64,8 +53,8 @@ extern const struct _mp_spiflash_config_t spiflash_config;
 #define MICROPY_HW_SPI2_NAME "Y"
 #define MICROPY_HW_SPI2_NSS  (pin_B12) // Y5
 #define MICROPY_HW_SPI2_SCK  (pin_B13) // Y6
-#define MICROPY_HW_SPI2_MISO (pin_B14) // Y7
-#define MICROPY_HW_SPI2_MOSI (pin_B15) // Y8
+#define MICROPY_HW_SPI2_MISO (pin_C2) // Y7
+#define MICROPY_HW_SPI2_MOSI (pin_C3) // Y8
 
 // CAN buses
 #define MICROPY_HW_CAN1_TX (pin_B9) // Y4
@@ -96,4 +85,39 @@ extern const struct _mp_spiflash_config_t spiflash_config;
 // MMA accelerometer config
 //#define MICROPY_HW_MMA_AVDD_PIN     (pin_B5)
 
+
+
+
+
+#define MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE (0)
+
+// External SPI flash on SPI2
+#define MICROPY_HW_SPIFLASH_CS    (pin_B12)
+#define MICROPY_HW_SPIFLASH_SCK   (pin_B13)
+#define MICROPY_HW_SPIFLASH_MOSI  (pin_C3)
+#define MICROPY_HW_SPIFLASH_MISO  (pin_C2)
+#define MICROPY_HW_SPIFLASH_BUS   (2) // SPI2
+
+#if !MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
+
+// Optional: early init to set CS high (implement in board_init.c if desired)
+#define MICROPY_BOARD_EARLY_INIT F405_SERGEY_V2_board_early_init
+void F405_SERGEY_V2_board_early_init(void);
+
+#define MICROPY_HW_SPIFLASH_ENABLE_CACHE (1)
+
+// Export the block device and its config to storage.c
+extern const struct _mp_spiflash_config_t spiflash_config;
+extern struct _spi_bdev_t spi_bdev;
+#define MICROPY_HW_BDEV_SPIFLASH        (&spi_bdev)
+#define MICROPY_HW_BDEV_SPIFLASH_CONFIG (&spiflash_config)
+
+// Size hint (W25Q128 = 128 Mbit = 16 MByte)
+#define MICROPY_HW_SPIFLASH_SIZE_BITS       (128 * 1024 * 1024)
+#define MICROPY_HW_BDEV_SPIFLASH_SIZE_BYTES (MICROPY_HW_SPIFLASH_SIZE_BITS / 8)
+
+// Whether to automatically mount (and boot from) the flash filesystem
+#define MICROPY_HW_ENABLE_STORAGE (1)
+
+#endif
 
