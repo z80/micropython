@@ -31,5 +31,14 @@ const mp_spiflash_config_t spiflash_config = {
 
 spi_bdev_t spi_bdev;
 
+
+int storage_readblocks_ext(uint8_t *dest, uint32_t block, uint32_t offset, uint32_t len) {
+    return spi_bdev_readblocks_raw(&spi_bdev, dest, block, offset, len);
+}
+
+int storage_writeblocks_ext(const uint8_t *src, uint32_t block, uint32_t offset, uint32_t len) {
+    return spi_bdev_writeblocks_raw(&spi_bdev, src, block, offset, len);
+}
+
 #endif
 
