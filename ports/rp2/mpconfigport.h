@@ -109,6 +109,7 @@
 #endif
 #elif PICO_RISCV
 #define MICROPY_EMIT_RV32                       (1)
+#define MICROPY_EMIT_RV32_ZBA                   (1)
 #define MICROPY_EMIT_INLINE_RV32                (1)
 #endif
 
@@ -278,8 +279,6 @@
 #endif
 
 #define MP_SSIZE_MAX (0x7fffffff)
-typedef intptr_t mp_int_t; // must be pointer size
-typedef uintptr_t mp_uint_t; // must be pointer size
 typedef intptr_t mp_off_t;
 
 // We need to provide a declaration/definition of alloca()

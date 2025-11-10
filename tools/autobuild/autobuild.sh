@@ -48,6 +48,9 @@ git -C ${MICROPY_AUTOBUILD_MICROPYTHON_REPO}/lib/pico-sdk submodule update --ini
 ########################################
 # Build all firmware
 
+# Fail on some things which are warnings otherwise
+export MICROPY_MAINTAINER_BUILD=1
+
 pushd ${MICROPY_AUTOBUILD_MICROPYTHON_REPO}
 
 # build cross compiler
@@ -58,7 +61,7 @@ make -C mpy-cross
 # where SEMVER is vX.Y.Z or vX.Y.Z-preview.N.gHASH or vX.Y.Z-preview.N.gHASH.dirty
 FW_DATE=$(date '+%Y%m%d')
 # same logic as makeversionhdr.py, convert git-describe output into semver-compatible
-FW_GIT_TAG="$(git describe --tags --dirty --always --match 'v[1-9].*')"
+FW_GIT_TAG="$(git describe --tags --dirty --always --match 'v[1-9].*' --abbrev=10)"
 FW_SEMVER_MAJOR_MINOR_PATCH="$(echo $FW_GIT_TAG | cut -d'-' -f1)"
 FW_SEMVER_PRERELEASE="$(echo $FW_GIT_TAG | cut -s -d'-' -f2-)"
 if [ -z "$FW_SEMVER_PRERELEASE" ]; then

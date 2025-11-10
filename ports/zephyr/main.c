@@ -48,7 +48,6 @@
 #include "py/repl.h"
 #include "py/gc.h"
 #include "py/mphal.h"
-#include "py/stackctrl.h"
 #include "shared/runtime/gchelper.h"
 #include "shared/runtime/pyexec.h"
 #include "shared/readline/readline.h"
@@ -95,42 +94,7 @@ void init_zephyr(void) {
     #endif
 }
 
-#if MICROPY_VFS
-static void vfs_init(void) {
-    mp_obj_t bdev = NULL;
-    mp_obj_t mount_point;
-    const char *mount_point_str = NULL;
-    qstr path_lib_qstr = MP_QSTRnull;
-    int ret = 0;
-
-    #ifdef CONFIG_DISK_DRIVER_SDMMC
-    #if KERNEL_VERSION_NUMBER >= ZEPHYR_VERSION(4, 0, 0)
-    mp_obj_t args[] = { mp_obj_new_str_from_cstr(DT_PROP(DT_INST(0, zephyr_sdmmc_disk), disk_name)) };
-    #else
-    mp_obj_t args[] = { mp_obj_new_str_from_cstr(CONFIG_SDMMC_VOLUME_NAME) };
-    #endif
-    bdev = MP_OBJ_TYPE_GET_SLOT(&zephyr_disk_access_type, make_new)(&zephyr_disk_access_type, ARRAY_SIZE(args), 0, args);
-    mount_point_str = "/sd";
-    path_lib_qstr = MP_QSTR__slash_sd_slash_lib;
-    #elif defined(CONFIG_FLASH_MAP) && FIXED_PARTITION_EXISTS(storage_partition)
-    mp_obj_t args[] = { MP_OBJ_NEW_SMALL_INT(FIXED_PARTITION_ID(storage_partition)), MP_OBJ_NEW_SMALL_INT(4096) };
-    bdev = MP_OBJ_TYPE_GET_SLOT(&zephyr_flash_area_type, make_new)(&zephyr_flash_area_type, ARRAY_SIZE(args), 0, args);
-    mount_point_str = "/flash";
-    path_lib_qstr = MP_QSTR__slash_flash_slash_lib;
-    #endif
-
-    if ((bdev != NULL)) {
-        mount_point = mp_obj_new_str_from_cstr(mount_point_str);
-        ret = mp_vfs_mount_and_chdir_protected(bdev, mount_point);
-        mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(path_lib_qstr));
-        // TODO: if this failed, make a new file system and try to mount again
-    }
-}
-#endif // MICROPY_VFS
-
 int real_main(void) {
-    volatile int stack_dummy = 0;
-
     #if MICROPY_PY_THREAD
     struct k_thread *z_thread = (struct k_thread *)k_current_get();
     mp_thread_init((void *)z_thread->stack_info.start, z_thread->stack_info.size / sizeof(uintptr_t));
@@ -140,9 +104,7 @@ int real_main(void) {
     mp_hal_init();
 
 soft_reset:
-    mp_stack_set_top((void *)&stack_dummy);
-    // Make MicroPython's stack limit somewhat smaller than full stack available
-    mp_stack_set_limit(CONFIG_MAIN_STACK_SIZE - 512);
+    mp_cstack_init_with_sp_here(CONFIG_MAIN_STACK_SIZE);
     #if MICROPY_ENABLE_GC
     gc_init(heap, heap + sizeof(heap));
     #endif
@@ -156,9 +118,11 @@ soft_reset:
     mp_usbd_init();
     #endif
 
-    #if MICROPY_VFS
-    vfs_init();
+    #if MICROPY_VFS && MICROPY_MODULE_FROZEN_MPY
+    // Mount and/or create the filesystem
+    pyexec_frozen_module("_boot.py", false);
     #endif
+
 
     #if MICROPY_MODULE_FROZEN || MICROPY_VFS
     // Execute user scripts.
@@ -186,7 +150,7 @@ soft_reset:
         }
     }
 
-    #if MICROPY_MODULE_FROZEN || MICROPY_VFS
+    #if MICROPY_MODULE_FROZEN_MPY || MICROPY_VFS
 soft_reset_exit:
     #endif
 

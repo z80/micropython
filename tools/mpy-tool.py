@@ -24,40 +24,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-# Python 2/3/MicroPython compatibility code
-from __future__ import print_function
-import sys
-
-if sys.version_info[0] == 2:
-    from binascii import hexlify as hexlify_py2
-
-    str_cons = lambda val, enc=None: str(val)
-    bytes_cons = lambda val, enc=None: bytearray(val)
-    is_str_type = lambda o: isinstance(o, str)
-    is_bytes_type = lambda o: type(o) is bytearray
-    is_int_type = lambda o: isinstance(o, int) or isinstance(o, long)  # noqa: F821
-
-    def hexlify_to_str(b):
-        x = hexlify_py2(b)
-        return ":".join(x[i : i + 2] for i in range(0, len(x), 2))
-
-elif sys.version_info[0] == 3:  # Also handles MicroPython
-    from binascii import hexlify
-
-    str_cons = str
-    bytes_cons = bytes
-    is_str_type = lambda o: isinstance(o, str)
-    is_bytes_type = lambda o: isinstance(o, bytes)
-    is_int_type = lambda o: isinstance(o, int)
-
-    def hexlify_to_str(b):
-        return str(hexlify(b, ":"), "ascii")
-
-
-# end compatibility code
-
-import sys
 import struct
+import sys
+from binascii import hexlify
+
+str_cons = str
+bytes_cons = bytes
+is_str_type = lambda o: isinstance(o, str)
+is_bytes_type = lambda o: isinstance(o, bytes)
+is_int_type = lambda o: isinstance(o, int)
+
+
+def hexlify_to_str(b):
+    return str(hexlify(b, ":"), "ascii")
+
 
 sys.path.append(sys.path[0] + "/../py")
 import makeqstrdata as qstrutil
@@ -114,6 +94,23 @@ MP_NATIVE_ARCH_ARMV7EMDP = 8
 MP_NATIVE_ARCH_XTENSA = 9
 MP_NATIVE_ARCH_XTENSAWIN = 10
 MP_NATIVE_ARCH_RV32IMC = 11
+MP_NATIVE_ARCH_RV64IMC = 12
+
+MP_NATIVE_ARCH_NAMES = [
+    "NONE",
+    "X86",
+    "X64",
+    "ARMV6",
+    "ARMV6M",
+    "ARMV7M",
+    "ARMV7EM",
+    "ARMV7EMSP",
+    "ARMV7EMDP",
+    "XTENSA",
+    "XTENSAWIN",
+    "RV32IMC",
+    "RV64IMC",
+]
 
 MP_PERSISTENT_OBJ_FUN_TABLE = 0
 MP_PERSISTENT_OBJ_NONE = 1
@@ -138,6 +135,8 @@ MP_BC_FORMAT_BYTE = 0
 MP_BC_FORMAT_QSTR = 1
 MP_BC_FORMAT_VAR_UINT = 2
 MP_BC_FORMAT_OFFSET = 3
+
+MP_NATIVE_ARCH_FLAGS_PRESENT = 0x40
 
 mp_unary_op_method_name = (
     "__pos__",
@@ -561,6 +560,7 @@ class CompiledModule:
         mpy_source_file,
         mpy_segments,
         header,
+        arch_flags,
         qstr_table,
         obj_table,
         raw_code,
@@ -573,6 +573,7 @@ class CompiledModule:
         self.mpy_segments = mpy_segments
         self.source_file = qstr_table[0]
         self.header = header
+        self.arch_flags = arch_flags
         self.qstr_table = qstr_table
         self.obj_table = obj_table
         self.raw_code = raw_code
@@ -650,6 +651,14 @@ class CompiledModule:
         print("mpy_source_file:", self.mpy_source_file)
         print("source_file:", self.source_file.str)
         print("header:", hexlify_to_str(self.header))
+        arch_index = (self.header[2] >> 2) & 0x2F
+        if arch_index >= len(MP_NATIVE_ARCH_NAMES):
+            arch_name = "UNKNOWN"
+        else:
+            arch_name = MP_NATIVE_ARCH_NAMES[arch_index]
+        print("arch:", arch_name)
+        if self.header[2] & MP_NATIVE_ARCH_FLAGS_PRESENT != 0:
+            print("arch_flags:", hex(self.arch_flags))
         print("qstr_table[%u]:" % len(self.qstr_table))
         for q in self.qstr_table:
             print("    %s" % q.str)
@@ -1081,6 +1090,7 @@ class RawCodeNative(RawCode):
             MP_NATIVE_ARCH_XTENSA,
             MP_NATIVE_ARCH_XTENSAWIN,
             MP_NATIVE_ARCH_RV32IMC,
+            MP_NATIVE_ARCH_RV64IMC,
         ):
             self.fun_data_attributes = '__attribute__((section(".text,\\"ax\\",@progbits # ")))'
         else:
@@ -1098,8 +1108,8 @@ class RawCodeNative(RawCode):
             self.fun_data_attributes += " __attribute__ ((aligned (4)))"
         elif (
             MP_NATIVE_ARCH_ARMV6M <= config.native_arch <= MP_NATIVE_ARCH_ARMV7EMDP
-        ) or config.native_arch == MP_NATIVE_ARCH_RV32IMC:
-            # ARMVxxM or RV32IMC -- two byte align.
+        ) or MP_NATIVE_ARCH_RV32IMC <= config.native_arch <= MP_NATIVE_ARCH_RV64IMC:
+            # ARMVxxM or RV{32,64}IMC -- two byte align.
             self.fun_data_attributes += " __attribute__ ((aligned (2)))"
 
     def disassemble(self):
@@ -1357,7 +1367,7 @@ def read_mpy(filename):
         if header[1] != config.MPY_VERSION:
             raise MPYReadError(filename, "incompatible .mpy version")
         feature_byte = header[2]
-        mpy_native_arch = feature_byte >> 2
+        mpy_native_arch = (feature_byte >> 2) & 0x2F
         if mpy_native_arch != MP_NATIVE_ARCH_NONE:
             mpy_sub_version = feature_byte & 3
             if mpy_sub_version != config.MPY_SUB_VERSION:
@@ -1367,6 +1377,11 @@ def read_mpy(filename):
             elif config.native_arch != mpy_native_arch:
                 raise MPYReadError(filename, "native architecture mismatch")
         config.mp_small_int_bits = header[3]
+
+        arch_flags = 0
+        # Read the architecture-specific flag bits if present.
+        if (feature_byte & MP_NATIVE_ARCH_FLAGS_PRESENT) != 0:
+            arch_flags = reader.read_uint()
 
         # Read number of qstrs, and number of objects.
         n_qstr = reader.read_uint()
@@ -1396,6 +1411,7 @@ def read_mpy(filename):
         filename,
         segments,
         header,
+        arch_flags,
         qstr_table,
         obj_table,
         raw_code,
@@ -1691,24 +1707,38 @@ def merge_mpy(compiled_modules, output_file):
             merged_mpy.extend(f.read())
     else:
         main_cm_idx = None
+        arch_flags = 0
         for idx, cm in enumerate(compiled_modules):
             feature_byte = cm.header[2]
-            mpy_native_arch = feature_byte >> 2
+            mpy_native_arch = (feature_byte >> 2) & 0x2F
             if mpy_native_arch:
                 # Must use qstr_table and obj_table from this raw_code
                 if main_cm_idx is not None:
                     raise Exception("can't merge files when more than one contains native code")
                 main_cm_idx = idx
+                arch_flags = cm.arch_flags
         if main_cm_idx is not None:
             # Shift main_cm to front of list.
             compiled_modules.insert(0, compiled_modules.pop(main_cm_idx))
 
+        if config.arch_flags is not None:
+            arch_flags = config.arch_flags
+
         header = bytearray(4)
         header[0] = ord("M")
         header[1] = config.MPY_VERSION
-        header[2] = config.native_arch << 2 | config.MPY_SUB_VERSION if config.native_arch else 0
+        header[2] = (
+            (MP_NATIVE_ARCH_FLAGS_PRESENT if arch_flags != 0 else 0)
+            | config.native_arch << 2
+            | config.MPY_SUB_VERSION
+            if config.native_arch
+            else 0
+        )
         header[3] = config.mp_small_int_bits
         merged_mpy.extend(header)
+
+        if arch_flags != 0:
+            merged_mpy.extend(mp_encode_uint(arch_flags))
 
         n_qstr = 0
         n_obj = 0
@@ -1841,6 +1871,12 @@ def main(args=None):
         default=16,
         help="mpz digit size used by target (default 16)",
     )
+    cmd_parser.add_argument(
+        "-march-flags",
+        metavar="F",
+        type=int,
+        help="architecture flags value to set in the output file (strips existing flags if not present)",
+    )
     cmd_parser.add_argument("-o", "--output", default=None, help="output file")
     cmd_parser.add_argument("files", nargs="+", help="input .mpy files")
     args = cmd_parser.parse_args(args)
@@ -1853,6 +1889,7 @@ def main(args=None):
     }[args.mlongint_impl]
     config.MPZ_DIG_SIZE = args.mmpz_dig_size
     config.native_arch = MP_NATIVE_ARCH_NONE
+    config.arch_flags = args.march_flags
 
     # set config values for qstrs, and get the existing base set of qstrs
     # already in the firmware
