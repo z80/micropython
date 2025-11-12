@@ -10,8 +10,7 @@ static mp_spiflash_cache_t spi_bdev_cache;
 
 static const spi_proto_cfg_t spi_bus = {
     .spi = &spi_obj[MICROPY_HW_SPIFLASH_BUS - 1],
-    //.baudrate = 25000000,
-    .baudrate = 1000000,
+    .baudrate = 24000000,
     .polarity = 0,
     .phase = 0,
     .bits = 8,
