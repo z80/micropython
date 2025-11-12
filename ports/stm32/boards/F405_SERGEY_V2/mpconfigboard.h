@@ -98,6 +98,10 @@
 #define MICROPY_HW_SPIFLASH_MOSI  (pin_C3)
 #define MICROPY_HW_SPIFLASH_MISO  (pin_C2)
 #define MICROPY_HW_SPIFLASH_BUS   (2) // SPI2
+// This setting makes SPI2 reserved and it is not de-initialized.
+// The user also cannot access it.
+// For access and not deinitialized need to use MICROPY_HW_SPI_IS_STATIC(id)
+#define MICROPY_HW_SPI_IS_RESERVED(id) (id == 2)  // Reserve SPI flash bus.
 
 #if !MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
 
