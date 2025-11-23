@@ -5,8 +5,10 @@
 #include "py/mperrno.h"
 #include "py/mphal.h"
 #include "extmod/virtpin.h"
+#include "extmod/modmachine.h"
 
 #include "i2c.h"
+#include "i2cslave.h"
 
 #include "bmi08.h"
 #include "bmi08x.h"
@@ -42,40 +44,46 @@ typedef struct _mp_bmi08_obj_t {
 
 int8_t bmi08_hal_read( uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_ptr) {
     bmi08_i2c_ctx_t *ctx = (bmi08_i2c_ctx_t *)intf_ptr;
-    pyb_i2c_obj_t *i2c = MP_OBJ_TO_PTR(ctx->i2c_obj);
-    I2C_HandleTypeDef *hi2c = i2c->i2c;
+    mp_obj_base_t *i2c_obj = MP_OBJ_TO_PTR(ctx->i2c_obj);
 
-    HAL_StatusTypeDef res = HAL_I2C_Mem_Read(
-        hi2c,
-        ctx->addr << 1,
-        reg_addr,
-        I2C_MEMADD_SIZE_8BIT,
-        data,
-        len,
-        I2C_TIMEOUT
-    );
+    mp_machine_i2c_p_t *i2c_p = (mp_machine_i2c_p_t *)MP_OBJ_TYPE_GET_SLOT(i2c_obj->type, protocol);
 
-    return (res == HAL_OK) ? BMI08_INTF_RET_SUCCESS : (BMI08_INTF_RET_SUCCESS + 1);
+    // Phase 1: write register address
+    uint8_t reg = reg_addr;
+    mp_machine_i2c_buf_t regbuf = { .len = 1, .buf = &reg };
+    int ret = i2c_p->transfer(i2c_obj, ctx->addr, 1, &regbuf, MP_MACHINE_I2C_FLAG_STOP);
+    if (ret < 0) {
+        return (BMI08_INTF_RET_SUCCESS+1);
+    }
+
+    // Phase 2: read data
+    mp_machine_i2c_buf_t databuf = { .len = len, .buf = data };
+    ret = i2c_p->transfer(i2c_obj, ctx->addr, 1, &databuf,
+                          MP_MACHINE_I2C_FLAG_READ | MP_MACHINE_I2C_FLAG_STOP);
+
+    return (ret >= 0) ? BMI08_INTF_RET_SUCCESS : (BMI08_INTF_RET_SUCCESS+1);
 }
 
 
 
 int8_t bmi08_hal_write(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
     bmi08_i2c_ctx_t *ctx = (bmi08_i2c_ctx_t *)intf_ptr;
-    pyb_i2c_obj_t *i2c = MP_OBJ_TO_PTR(ctx->i2c_obj);
-    I2C_HandleTypeDef *hi2c = i2c->i2c;
+    mp_obj_base_t *i2c_obj = MP_OBJ_TO_PTR(ctx->i2c_obj);
 
-    HAL_StatusTypeDef res = HAL_I2C_Mem_Write(
-        hi2c,
-        ctx->addr << 1,
-        reg_addr,
-        I2C_MEMADD_SIZE_8BIT,
-        (uint8_t *)data,
-        len,
-        I2C_TIMEOUT
-    );
+    // Get protocol table
+    mp_machine_i2c_p_t *i2c_p = (mp_machine_i2c_p_t *)MP_OBJ_TYPE_GET_SLOT(i2c_obj->type, protocol);
 
-    return (res == HAL_OK) ? BMI08_INTF_RET_SUCCESS : (BMI08_INTF_RET_SUCCESS + 1);
+    // Two buffers: register address, then payload
+    uint8_t reg = reg_addr;
+    mp_machine_i2c_buf_t bufs[2] = {
+        { .len = 1, .buf = &reg },
+        { .len = len, .buf = (uint8_t *)data },
+    };
+
+    // Perform transfer: write both buffers in sequence
+    int ret = i2c_p->transfer(i2c_obj, ctx->addr, 2, bufs, MP_MACHINE_I2C_FLAG_STOP);
+
+    return (ret >= 0) ? BMI08_INTF_RET_SUCCESS : (BMI08_INTF_RET_SUCCESS+1);
 }
 
 
@@ -103,8 +111,8 @@ STATIC void bmi08_check_rslt(int8_t rslt, const char *msg) {
 
 // Constructor.
 STATIC mp_obj_t bmi08_make_new(const mp_obj_type_t *type,
-                                size_t n_args, size_t n_kw,
-                                const mp_obj_t *args) {
+                               size_t n_args, size_t n_kw,
+                               const mp_obj_t *all_args) {
     enum { ARG_i2c, ARG_use_primary_acc, ARG_use_primary_gyro };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_i2c, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
@@ -113,34 +121,51 @@ STATIC mp_obj_t bmi08_make_new(const mp_obj_type_t *type,
     };
 
     mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
-    mp_arg_parse_all(n_args, args, NULL, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+    // Correct parsing for positional + keyword arguments
+    mp_arg_parse_all_kw_array(n_args, n_kw, all_args,
+                              MP_ARRAY_SIZE(allowed_args),
+                              allowed_args, parsed_args);
 
     mp_obj_t i2c_obj = parsed_args[ARG_i2c].u_obj;
-
+    mp_obj_base_t *i2c_ptr = MP_OBJ_TO_PTR(i2c_obj);
+    /*{
+        mp_obj_base_t * i2c_obj_p = MP_OBJ_TO_PTR(i2c_obj);
+	mp_machine_i2c_p_t *i2c_p = (mp_machine_i2c_p_t *)MP_OBJ_TYPE_GET_SLOT(i2c_obj_p->type, protocol);
+	(void)i2c_p;
+	machine_hard_i2c_obj_t *i2c_h = MP_OBJ_TO_PTR(i2c_p);
+	(void)i2c_h;
+	// Then ise i2c_h->i2c;
+    }*/
     bool use_primary_acc = parsed_args[ARG_use_primary_acc].u_bool;
     bool use_primary_gyro = parsed_args[ARG_use_primary_gyro].u_bool;
 
+    // Allocate object
     mp_bmi08_obj_t *self = m_new_obj(mp_bmi08_obj_t);
     self->base.type = type;
 
-    self->acc_ctx.i2c_obj = i2c_obj;
-    self->acc_ctx.addr = use_primary_acc ? BMI08_ACCEL_I2C_ADDR_PRIMARY : BMI08_ACCEL_I2C_ADDR_SECONDARY;
+    // Setup accel context
+    self->acc_ctx.i2c_obj = i2c_ptr;
+    self->acc_ctx.addr = use_primary_acc ?
+        BMI08_ACCEL_I2C_ADDR_PRIMARY : BMI08_ACCEL_I2C_ADDR_SECONDARY;
 
+    // Setup gyro context
     self->gyro_ctx.i2c_obj = i2c_obj;
-    self->gyro_ctx.addr = use_primary_gyro ? BMI08_GYRO_I2C_ADDR_PRIMARY : BMI08_GYRO_I2C_ADDR_SECONDARY;
+    self->gyro_ctx.addr = use_primary_gyro ?
+        BMI08_GYRO_I2C_ADDR_PRIMARY : BMI08_GYRO_I2C_ADDR_SECONDARY;
 
+    // Setup Bosch driver device struct
     self->dev.intf_ptr_accel = &self->acc_ctx;
     self->dev.intf_ptr_gyro  = &self->gyro_ctx;
-
-    self->dev.intf = BMI08_I2C_INTF;
-    self->dev.read = bmi08_hal_read;
-    self->dev.write = bmi08_hal_write;
-    self->dev.delay_us = bmi08_delay_us;
+    self->dev.intf           = BMI08_I2C_INTF;
+    self->dev.read           = bmi08_hal_read;
+    self->dev.write          = bmi08_hal_write;
+    self->dev.delay_us       = bmi08_delay_us;
     self->dev.read_write_len = BMI08_READ_WRITE_LEN;
-    self->dev.variant = BMI085_VARIANT;
+    self->dev.variant        = BMI085_VARIANT;
 
     return MP_OBJ_FROM_PTR(self);
 }
+
 
 // Initializing the IMU.
 STATIC mp_obj_t bmi08_init(mp_obj_t self_in) {
@@ -334,17 +359,14 @@ STATIC const mp_rom_map_elem_t bmi08_locals_dict_table[] = {
 STATIC MP_DEFINE_CONST_DICT(bmi08_locals_dict, bmi08_locals_dict_table);
 
 
-STATIC const mp_obj_type_t bmi08_type = {
-    .base = { &mp_type_type },
-    .flags = 0,
-    .name = MP_QSTR_BMI08,
-    .slot_index_make_new = 0,
-    .slot_index_locals_dict = 1,
-    .slots = {
-        (void *)bmi08_make_new,
-        (void *)&bmi08_locals_dict,
-    },
-};
+// Legacy-style type definition
+MP_DEFINE_CONST_OBJ_TYPE(
+    bmi08_type,
+    MP_QSTR_BMI08,
+    MP_TYPE_FLAG_NONE,
+    make_new, bmi08_make_new,                // constructor
+    locals_dict, &bmi08_locals_dict          // methods
+);
 
 
 // Object itself.
@@ -352,6 +374,7 @@ STATIC const mp_rom_map_elem_t bmi08_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_BMI08), MP_ROM_PTR(&bmi08_type) },
 };
 STATIC MP_DEFINE_CONST_DICT(bmi08_module_globals, bmi08_module_globals_table);
+
 
 const mp_obj_module_t bmi08_user_cmodule = {
     .base = { &mp_type_module },
