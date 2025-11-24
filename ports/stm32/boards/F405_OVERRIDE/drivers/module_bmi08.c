@@ -243,14 +243,49 @@ STATIC mp_obj_t bmi08_init_gyro_fifo(mp_obj_t self_in) {
     mp_bmi08_obj_t *self = MP_OBJ_TO_PTR(self_in);
     int8_t rslt;
 
+    rslt = bmi08xa_init(&self->dev);
+    if (rslt != BMI08_OK)
+    {
+        mp_raise_msg_varg( &mp_type_RuntimeError, MP_ERROR_TEXT("XA init failed: %d"), rslt );
+    }
+
     // 1. Initialize gyro interface
     rslt = bmi08g_init(&self->dev);
     if (rslt != BMI08_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Gyro init failed: %d"), rslt);
     }
 
-    // 2. Set gyro power mode
+    self->dev.accel_cfg.odr = BMI08_ACCEL_ODR_100_HZ;
+
+    if (self->dev.variant == BMI085_VARIANT)
+    {
+        self->dev.accel_cfg.range = BMI085_ACCEL_RANGE_2G;
+    }
+    else if (self->dev.variant == BMI088_VARIANT)
+    {
+        self->dev.accel_cfg.range = BMI088_ACCEL_RANGE_24G;
+    }
+
+    self->dev.accel_cfg.power = BMI08_ACCEL_PM_ACTIVE;
+    self->dev.accel_cfg.bw = BMI08_ACCEL_BW_NORMAL; /* Bandwidth and OSR are same */
+
+    rslt = bmi08a_set_power_mode(&(self->dev));
+    if (rslt != BMI08_OK) {
+        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Acc power mode failed: %d"), rslt);
+    }
+
+    rslt = bmi08xa_set_meas_conf(&self->dev);
+    if (rslt != BMI08_OK) {
+        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("XA set meas conf failed: %d"), rslt);
+    }
+
+
+    self->dev.gyro_cfg.odr = BMI08_GYRO_BW_32_ODR_100_HZ;
+    self->dev.gyro_cfg.range = BMI08_GYRO_RANGE_125_DPS;
+    self->dev.gyro_cfg.bw = BMI08_GYRO_BW_32_ODR_100_HZ;
     self->dev.gyro_cfg.power = BMI08_GYRO_PM_NORMAL;
+
+    // 2. Set gyro power mode
     rslt = bmi08g_set_power_mode(&self->dev);
     if (rslt != BMI08_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Gyro power mode failed: %d"), rslt);
@@ -258,23 +293,20 @@ STATIC mp_obj_t bmi08_init_gyro_fifo(mp_obj_t self_in) {
 
     // 3. Set gyro ODR and range (combined ODR+BW constant)
     self->dev.gyro_cfg.odr = BMI08_GYRO_BW_47_ODR_400_HZ;
-    self->dev.gyro_cfg.range = BMI08_GYRO_RANGE_2000_DPS;
+    //self->dev.gyro_cfg.range = BMI08_GYRO_RANGE_2000_DPS;
+    self->dev.gyro_cfg.range = BMI08_GYRO_RANGE_250_DPS;
 
     rslt = bmi08g_set_meas_conf(&self->dev);
     if (rslt != BMI08_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Gyro meas config failed: %d"), rslt);
     }
 
-    // 4. Configure gyro FIFO (headerless, XYZ data only)
-    struct bmi08_gyr_fifo_config fifo_cfg = {0};
-    fifo_cfg.mode = BMI08_GYRO_FIFO_MODE;          // FIFO mode
-    fifo_cfg.data_select = BMI08_GYRO_FIFO_XYZ_AXIS_ENABLED;    // Enable XYZ gyro data
-    fifo_cfg.tag = BMI08_DISABLE;                  // Headerless mode
-    fifo_cfg.frame_count = 0;                      // Not used during config
-    fifo_cfg.wm_level = 0;                         // Optional: set if using watermark interrupt
 
+    struct bmi08_gyr_fifo_config fifo_conf = { 0 };
+    fifo_conf.mode = BMI08_GYRO_FIFO_MODE;
+    fifo_conf.tag = BMI08_GYRO_FIFO_TAG_DISABLED;
 
-    rslt = bmi08g_set_fifo_config(&fifo_cfg, &self->dev);
+    rslt = bmi08g_set_fifo_config(&fifo_conf, &self->dev);
     if (rslt != BMI08_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Gyro FIFO config failed: %d"), rslt);
     }
@@ -290,24 +322,25 @@ STATIC mp_obj_t bmi08_read_gyro_sum(mp_obj_t self_in) {
     int8_t rslt;
 
     // 1. Prepare FIFO config (must match init)
-    struct bmi08_gyr_fifo_config fifo_cfg = {
-        .mode = BMI08_GYRO_FIFO_MODE,
-        .data_select = BMI08_GYRO_FIFO_XYZ_AXIS_ENABLED,
-        .tag = BMI08_DISABLE,
-        .frame_count = 0,
-        .wm_level = 0
-    };
+    struct bmi08_gyr_fifo_config fifo_conf = { 0 };
+    fifo_conf.mode = BMI08_GYRO_FIFO_MODE;
+    fifo_conf.tag = BMI08_GYRO_FIFO_TAG_DISABLED;
 
     // 2. Prepare FIFO frame buffer
-    uint8_t fifo_data[256] = {0};  // adjust size as needed
+    uint8_t fifo_data[120] = {0};  // adjust size as needed
     struct bmi08_fifo_frame fifo = {
         .data = fifo_data,
         .length = sizeof(fifo_data)
     };
 
+    rslt = bmi08g_get_fifo_config(&fifo_conf, &self->dev);
+    if (rslt != BMI08_OK) {
+        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Get FIFO config error: %d"), rslt);
+    }
+
     // 3. Get FIFO length
-    rslt = bmi08g_get_fifo_length(&fifo_cfg, &fifo);
-    if (rslt != BMI08_OK || fifo.length == 0) {
+    rslt = bmi08g_get_fifo_length(&fifo_conf, &fifo);
+    if (rslt != BMI08_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("FIFO length error: %d"), rslt);
     }
 
@@ -318,10 +351,10 @@ STATIC mp_obj_t bmi08_read_gyro_sum(mp_obj_t self_in) {
     }
 
     // 5. Extract gyro frames
-    struct bmi08_sensor_data gyro_frames[32] = {0};  // adjust size as needed
-    uint16_t frame_count = 0;
+    struct bmi08_sensor_data gyro_frames[20] = {0};  // adjust size as needed
+    uint16_t frame_count = fifo.length / sizeof(struct bmi08_sensor_data);
 
-    bmi08g_extract_gyro(gyro_frames, &frame_count, &fifo_cfg, &fifo);
+    bmi08g_extract_gyro(gyro_frames, &frame_count, &fifo_conf, &fifo);
 
     // 6. Accumulate angular deltas
     int32_t x_sum = 0, y_sum = 0, z_sum = 0;
@@ -334,11 +367,11 @@ STATIC mp_obj_t bmi08_read_gyro_sum(mp_obj_t self_in) {
     // Return tuple: (x_sum, y_sum, z_sum, frame_count)
     // scale for 2000dps at 200 Hz
     // scale = x / 32768 * 2000 / 200 = 0.00030517578125
-    const float SCALE = 0.00030517578125;
+    //const float SCALE = 0.00030517578125;
     mp_obj_t tuple[4] = {
-        mp_obj_new_int( (int)( (float)(x_sum) * SCALE ) ),
-        mp_obj_new_int( (int)( (float)(y_sum) * SCALE ) ),
-        mp_obj_new_int( (int)( (float)(z_sum) * SCALE ) ), 
+        mp_obj_new_int( x_sum ),
+        mp_obj_new_int( y_sum ),
+        mp_obj_new_int( z_sum ), 
         mp_obj_new_int(frame_count)
     };
     return mp_obj_new_tuple(4, tuple);
