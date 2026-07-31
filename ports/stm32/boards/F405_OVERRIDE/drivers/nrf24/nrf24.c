@@ -42,35 +42,35 @@ uint8_t nrf24_reg_write_bytes(nrf24_t *self, uint8_t reg, const uint8_t *buf, si
 }
 
 uint8_t nrf24_read_status(nrf24_t *self) {
-    return nrf24_cmd_read(self, NOP);
+    return nrf24_cmd_read(self, NRF24_CMD_NOP);
 }
 
-void nrf24_flush_rx(nrf24_t *self) { nrf24_cmd_read(self, FLUSH_RX); }
-void nrf24_flush_tx(nrf24_t *self) { nrf24_cmd_read(self, FLUSH_TX); }
+void nrf24_flush_rx(nrf24_t *self) { nrf24_cmd_read(self, NRF24_CMD_FLUSH_RX); }
+void nrf24_flush_tx(nrf24_t *self) { nrf24_cmd_read(self, NRF24_CMD_FLUSH_TX); }
 
 void nrf24_power_up(nrf24_t *self) {
     if (self->powered) return;
-    uint8_t config = nrf24_reg_read(self, CONFIG);
-    nrf24_reg_write(self, CONFIG, config | PWR_UP);
+    uint8_t config = nrf24_reg_read(self, NRF24_REG_CONFIG);
+    nrf24_reg_write(self, NRF24_REG_CONFIG, config | NRF24_CFG_PWR_UP);
     self->delay_us(1500);
     self->powered = true;
 }
 
 void nrf24_power_down(nrf24_t *self) {
     self->ce_set(self, 0);
-    uint8_t config = nrf24_reg_read(self, CONFIG);
-    nrf24_reg_write(self, CONFIG, config & ~PWR_UP);
+    uint8_t config = nrf24_reg_read(self, NRF24_REG_CONFIG);
+    nrf24_reg_write(self, NRF24_REG_CONFIG, config & ~NRF24_CFG_PWR_UP);
     self->powered = false;
 }
 
 void nrf24_set_power_speed(nrf24_t *self, uint8_t power, uint8_t speed) {
-    uint8_t setup = nrf24_reg_read(self, RF_SETUP) & 0b11010001;
-    nrf24_reg_write(self, RF_SETUP, setup | power | speed);
+    uint8_t setup = nrf24_reg_read(self, NRF24_REG_RF_SETUP) & 0b11010001;
+    nrf24_reg_write(self, NRF24_REG_RF_SETUP, setup | power | speed);
 }
 
 void nrf24_set_channel(nrf24_t *self, uint8_t channel) {
     if (channel > 125) channel = 125;
-    nrf24_reg_write(self, RF_CH, channel);
+    nrf24_reg_write(self, NRF24_REG_RF_CH, channel);
 }
 
 void nrf24_init(nrf24_t *self, uint8_t channel, uint8_t payload_size, uint8_t speed, uint8_t power, uint16_t ard_us, uint8_t arc) {
@@ -80,21 +80,21 @@ void nrf24_init(nrf24_t *self, uint8_t channel, uint8_t payload_size, uint8_t sp
 
     self->delay_us(5000);
     
-    nrf24_reg_write(self, SETUP_AW, 0b11);
-    nrf24_reg_write(self, DYNPD, 0);
+    nrf24_reg_write(self, NRF24_REG_SETUP_AW, 0b11);
+    nrf24_reg_write(self, NRF24_REG_DYNPD, 0);
 
     uint8_t ard_steps = ard_us / 250;
     if (ard_steps > 0) ard_steps--;
     if (ard_steps > 15) ard_steps = 15;
     
-    nrf24_reg_write(self, SETUP_RETR, (ard_steps << 4) | (arc & 0x0F));
+    nrf24_reg_write(self, NRF24_REG_SETUP_RETR, (ard_steps << 4) | (arc & 0x0F));
     nrf24_set_power_speed(self, power, speed);
     
     // set_crc(2) logic
-    uint8_t config = nrf24_reg_read(self, CONFIG) & ~(CRCO | EN_CRC);
-    nrf24_reg_write(self, CONFIG, config | EN_CRC | CRCO);
+    uint8_t config = nrf24_reg_read(self, NRF24_REG_CONFIG) & ~(NRF24_CFG_CRCO | NRF24_CFG_EN_CRC);
+    nrf24_reg_write(self, NRF24_REG_CONFIG, config | NRF24_CFG_EN_CRC | NRF24_CFG_CRCO);
     
-    nrf24_reg_write(self, STATUS, RX_DR | TX_DS | MAX_RT);
+    nrf24_reg_write(self, NRF24_REG_STATUS, NRF24_STATUS_RX_DR | NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT);
     nrf24_set_channel(self, channel);
     nrf24_flush_rx(self);
     nrf24_flush_tx(self);
@@ -102,20 +102,20 @@ void nrf24_init(nrf24_t *self, uint8_t channel, uint8_t payload_size, uint8_t sp
 }
 
 void nrf24_open_tx_pipe(nrf24_t *self, const uint8_t *address) {
-    nrf24_reg_write_bytes(self, RX_ADDR_P0, address, 5);
-    nrf24_reg_write_bytes(self, TX_ADDR, address, 5);
-    nrf24_reg_write(self, RX_PW_P0, self->payload_size);
-    nrf24_reg_write(self, EN_RXADDR, nrf24_reg_read(self, EN_RXADDR) | 0x01);
+    nrf24_reg_write_bytes(self, NRF24_REG_RX_ADDR_P0, address, NRF24_ADDR_LEN);
+    nrf24_reg_write_bytes(self, NRF24_REG_TX_ADDR, address, NRF24_ADDR_LEN);
+    nrf24_reg_write(self, NRF24_REG_RX_PW_P0, self->payload_size);
+    nrf24_reg_write(self, NRF24_REG_EN_RXADDR, nrf24_reg_read(self, NRF24_REG_EN_RXADDR) | 0x01);
 }
 
 void nrf24_start_listening(nrf24_t *self) {
     nrf24_power_up(self);
-    uint8_t config = nrf24_reg_read(self, CONFIG);
-    nrf24_reg_write(self, CONFIG, config | PRIM_RX);
-    nrf24_reg_write(self, STATUS, RX_DR | TX_DS | MAX_RT);
+    uint8_t config = nrf24_reg_read(self, NRF24_REG_CONFIG);
+    nrf24_reg_write(self, NRF24_REG_CONFIG, config | NRF24_CFG_PRIM_RX);
+    nrf24_reg_write(self, NRF24_REG_STATUS, NRF24_STATUS_RX_DR | NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT);
 
     if (self->has_pipe0_addr) {
-        nrf24_reg_write_bytes(self, RX_ADDR_P0, self->pipe0_read_addr, 5);
+        nrf24_reg_write_bytes(self, NRF24_REG_RX_ADDR_P0, self->pipe0_read_addr, NRF24_ADDR_LEN);
     }
     self->ce_set(self, 1);
     self->delay_us(130);
@@ -123,11 +123,11 @@ void nrf24_start_listening(nrf24_t *self) {
 
 void nrf24_send_start(nrf24_t *self, const uint8_t *buf, size_t len) {
     nrf24_power_up(self);
-    uint8_t config = nrf24_reg_read(self, CONFIG);
-    nrf24_reg_write(self, CONFIG, (config | PWR_UP) & ~PRIM_RX);
-    nrf24_reg_write(self, STATUS, RX_DR | TX_DS | MAX_RT);
+    uint8_t config = nrf24_reg_read(self, NRF24_REG_CONFIG);
+    nrf24_reg_write(self, NRF24_REG_CONFIG, (config | NRF24_CFG_PWR_UP) & ~NRF24_CFG_PRIM_RX);
+    nrf24_reg_write(self, NRF24_REG_STATUS, NRF24_STATUS_RX_DR | NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT);
 
-    uint8_t cmd = W_TX_PAYLOAD;
+    uint8_t cmd = NRF24_CMD_W_TX_PAYLOAD;
     self->csn_set(self, 0);
     self->spi_transfer(self, 1, &cmd, NULL);
     self->spi_transfer(self, len, buf, NULL);
@@ -149,17 +149,17 @@ void nrf24_send_start(nrf24_t *self, const uint8_t *buf, size_t len) {
 
 int8_t nrf24_send_done(nrf24_t *self) {
     uint8_t status = nrf24_read_status(self);
-    if (!(status & (TX_DS | MAX_RT))) return 0; // In progress
+    if (!(status & (NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT))) return 0; // In progress
     
-    nrf24_reg_write(self, STATUS, RX_DR | TX_DS | MAX_RT); // Clear flags
-    if (status & TX_DS) return 1; // Success
+    nrf24_reg_write(self, NRF24_REG_STATUS, NRF24_STATUS_RX_DR | NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT); // Clear flags
+    if (status & NRF24_STATUS_TX_DS) return 1; // Success
     return 2; // Failure (MAX_RT)
 }
 
 void nrf24_abort_send(nrf24_t *self) {
     self->ce_set(self, 0);
     nrf24_flush_tx(self);
-    nrf24_reg_write(self, STATUS, TX_DS | MAX_RT);
+    nrf24_reg_write(self, NRF24_REG_STATUS, NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT);
 }
 
 int8_t nrf24_send(nrf24_t *self, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
