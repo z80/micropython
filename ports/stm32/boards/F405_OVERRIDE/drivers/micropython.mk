@@ -27,6 +27,7 @@ endif
 
 ifeq ($(BOARD_ENABLE_NRF24),1)
 SRC_USERMOD += $(USERMOD_DIR)/module_nrf24.c
+SRC_USERMOD += $(USERMOD_DIR)/nrf24/nrf24.c
 # SRC_USERMOD += $(USERMOD_DIR)/nrf24_core.c   # if split
 CFLAGS_USERMOD += -I$(USERMOD_DIR)/nrf24 -DMODULE_NRF24_ENABLED=1
 endif

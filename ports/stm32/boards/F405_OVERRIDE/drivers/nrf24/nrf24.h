@@ -9,7 +9,7 @@ typedef struct _nrf24_t nrf24_t;
 
 // Hardware Abstraction Function Pointers
 typedef void (*nrf24_spi_transfer_t)(nrf24_t *self, size_t len, const uint8_t *src, uint8_t *dest);
-typedef void (*nrf24_pin_set_t)(nrf24_t *self, int state);
+typedef void (*nrf24_pin_set_t)(nrf24_t *self, uint8_t state);
 typedef void (*nrf24_delay_us_t)(uint32_t us);
 typedef uint32_t (*nrf24_ticks_ms_t)(void); // Needed for blocking send timeouts
 
