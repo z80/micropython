@@ -51,8 +51,16 @@ STATIC void csn_high(mp_nrf24_obj_t *self) { mp_hal_pin_write(self->csn, 1); }
 STATIC void ce_low(mp_nrf24_obj_t *self)   { mp_hal_pin_write(self->ce, 0); }
 STATIC void ce_high(mp_nrf24_obj_t *self)  { mp_hal_pin_write(self->ce, 1); }
 
-STATIC void spi_transfer(mp_nrf24_obj_t *self, size_t len, const uint8_t *src, uint8_t *dest) {
-    mp_machine_spi_transfer(self->spi, len, src, dest);
+
+STATIC void spi_transfer(mp_nrf24_obj_t * self, size_t len, const uint8_t *tx, uint8_t *rx) {
+    mp_obj_base_t *s = (mp_obj_base_t *)MP_OBJ_TO_PTR(self->spi);
+    
+    // Retrieve the protocol table from the SPI object type
+    mp_machine_spi_p_t *spi_p = (mp_machine_spi_p_t *)MP_OBJ_TYPE_GET_SLOT(s->type, protocol);
+    
+    if (spi_p && spi_p->transfer) {
+        spi_p->transfer(s, len, tx, rx);
+    }
 }
 
 STATIC uint8_t nrf_read_reg(mp_nrf24_obj_t *self, uint8_t reg) {
