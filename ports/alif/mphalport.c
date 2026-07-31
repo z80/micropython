@@ -167,7 +167,9 @@ void mp_hal_delay_ms(mp_uint_t ms) {
 }
 
 uint64_t mp_hal_time_ns(void) {
-    return 0;
+    uint32_t microseconds;
+    uint32_t s = mp_hal_time_get(&microseconds);
+    return (uint64_t)s * 1000000000ULL + (uint64_t)microseconds * 1000ULL;
 }
 
 void mp_hal_pin_config(const machine_pin_obj_t *pin, uint32_t mode,
@@ -265,5 +267,19 @@ void mp_hal_get_mac_ascii(int idx, size_t chr_off, size_t chr_len, char *dest) {
     mp_hal_get_mac(idx, mac);
     for (; chr_len; ++chr_off, --chr_len) {
         *dest++ = hexchr[mac[chr_off >> 1] >> (4 * (1 - (chr_off & 1))) & 0xf];
+    }
+}
+
+void mp_hal_get_random(size_t n, uint8_t *buf) {
+    uint64_t rnd = 0;
+    size_t rnd_bits = 0;
+    for (int i = 0; i < n; i++) {
+        if (rnd_bits == 0) {
+            rnd = se_services_rand64();
+            rnd_bits = 64;
+        }
+        buf[i] = rnd;
+        rnd >>= 8;
+        rnd_bits -= 8;
     }
 }

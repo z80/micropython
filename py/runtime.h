@@ -52,6 +52,13 @@ typedef enum {
     MP_ARG_KW_ONLY   = 0x200,
 } mp_arg_flag_t;
 
+// These first two enum values match the original signature of `mp_handle_pending(bool)`.
+typedef enum {
+    MP_HANDLE_PENDING_CALLBACKS_AND_CLEAR_EXCEPTIONS = false,
+    MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS = true,
+    MP_HANDLE_PENDING_CALLBACKS_ONLY,
+} mp_handle_pending_behaviour_t;
+
 typedef union _mp_arg_val_t {
     bool u_bool;
     mp_int_t u_int;
@@ -100,7 +107,8 @@ void mp_sched_keyboard_interrupt(void);
 #if MICROPY_ENABLE_VM_ABORT
 void mp_sched_vm_abort(void);
 #endif
-void mp_handle_pending(bool raise_exc);
+
+void mp_handle_pending(mp_handle_pending_behaviour_t behavior);
 
 #if MICROPY_ENABLE_SCHEDULER
 void mp_sched_lock(void);

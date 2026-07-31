@@ -36,7 +36,6 @@
 #include "py/parse.h"
 #include "py/obj.h"
 #include "py/runtime.h"
-#include "py/stackctrl.h"
 #include "py/gc.h"
 #include "py/compile.h"
 #include "py/persistentcode.h"
@@ -126,11 +125,7 @@ soft_reset:
 
     led_state(1, 1); // MICROPY_HW_LED_1 aka MICROPY_HW_LED_RED
 
-    mp_stack_set_top(&_ram_end);
-
-    // Stack limit should be less than real stack size, so we have a chance
-    // to recover from limit hit.  (Limit is measured in bytes.)
-    mp_stack_set_limit((char *)&_ram_end - (char *)&_heap_end - 400);
+    mp_cstack_init_with_top(&_ram_end, (char *)&_ram_end - (char *)&_heap_end);
 
     machine_init();
 
@@ -182,22 +177,8 @@ soft_reset:
 
     #if MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
     flashbdev_init();
-
-    // Try to mount the flash on "/flash" and chdir to it for the boot-up directory.
-    mp_obj_t mount_point = MP_OBJ_NEW_QSTR(MP_QSTR__slash_flash);
-    int ret = mp_vfs_mount_and_chdir_protected((mp_obj_t)&nrf_flash_obj, mount_point);
-
-    if ((ret == -MP_ENODEV) || (ret == -MP_EIO)) {
-        pyexec_frozen_module("_mkfs.py", false); // Frozen script for formatting flash filesystem.
-        ret = mp_vfs_mount_and_chdir_protected((mp_obj_t)&nrf_flash_obj, mount_point);
-    }
-
-    if (ret != 0) {
-        printf("MPY: can't mount flash\n");
-    } else {
-        mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR__slash_flash));
-        mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR__slash_flash_slash_lib));
-    }
+    // Execute _boot.py to set up the filesystem.
+    pyexec_frozen_module("_boot.py", false);
     #endif
 
     #if MICROPY_MBFS
@@ -331,11 +312,6 @@ mp_lexer_t *mp_lexer_new_from_file(qstr filename) {
 mp_import_stat_t mp_import_stat(const char *path) {
     return MP_IMPORT_STAT_NO_EXIST;
 }
-
-mp_obj_t mp_builtin_open(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs) {
-    mp_raise_OSError(MP_EPERM);
-}
-MP_DEFINE_CONST_FUN_OBJ_KW(mp_builtin_open_obj, 1, mp_builtin_open);
 #endif
 #endif
 
@@ -373,7 +349,7 @@ void MP_WEAK __assert_func(const char *file, int line, const char *func, const c
     __fatal_error("Assertion failed");
 }
 
-#if MICROPY_EMIT_MACHINE_CODE
+#if MICROPY_EMIT_INLINE_THUMB || MICROPY_ENABLE_NATIVE_CODE
 void *nrf_native_code_commit(void *buf, unsigned int len, void *reloc) {
     (void)len;
     if (reloc) {

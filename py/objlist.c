@@ -277,10 +277,20 @@ static mp_obj_t list_pop(size_t n_args, const mp_obj_t *args) {
     return ret;
 }
 
+// "head" is actually the *exclusive lower bound* of the range to sort. That is,
+// the first element to be sorted is `head[1]`, not `head[0]`. Similarly `tail`
+// is an *inclusive upper bound* of the range to sort. That is, the final
+// element to sort is `tail[0]`, not `tail[-1]`.
+//
+// The pivot element is always chosen as `tail[0]`.
+//
+// These unusual choices allows structuring the partitioning
+// process as a do/while loop, which generates smaller code than the equivalent
+// code with usual C bounds & a while or for loop.
 static void mp_quicksort(mp_obj_t *head, mp_obj_t *tail, mp_obj_t key_fn, mp_obj_t binop_less_result) {
     mp_cstack_check();
-    while (head < tail) {
-        mp_obj_t *h = head - 1;
+    while (tail - head > 1) { // So long as at least 2 elements remain
+        mp_obj_t *h = head;
         mp_obj_t *t = tail;
         mp_obj_t v = key_fn == MP_OBJ_NULL ? tail[0] : mp_call_function_1(key_fn, tail[0]); // get pivot using key_fn
         for (;;) {
@@ -291,19 +301,21 @@ static void mp_quicksort(mp_obj_t *head, mp_obj_t *tail, mp_obj_t key_fn, mp_obj
             if (h >= t) {
                 break;
             }
+            // A pair of objects must be swapped to the other side of the partition
             mp_obj_t x = h[0];
             h[0] = t[0];
             t[0] = x;
         }
+        // Place the pivot element in the proper position
         mp_obj_t x = h[0];
         h[0] = tail[0];
         tail[0] = x;
         // do the smaller recursive call first, to keep stack within O(log(N))
-        if (t - head < tail - h - 1) {
+        if (t - head < tail - h) {
             mp_quicksort(head, t, key_fn, binop_less_result);
-            head = h + 1;
+            head = h;
         } else {
-            mp_quicksort(h + 1, tail, key_fn, binop_less_result);
+            mp_quicksort(h, tail, key_fn, binop_less_result);
             tail = t;
         }
     }
@@ -327,7 +339,7 @@ mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_obj_list_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
     if (self->len > 1) {
-        mp_quicksort(self->items, self->items + self->len - 1,
+        mp_quicksort(self->items - 1, self->items + self->len - 1,
             args.key.u_obj == mp_const_none ? MP_OBJ_NULL : args.key.u_obj,
             args.reverse.u_bool ? mp_const_false : mp_const_true);
     }
@@ -477,25 +489,6 @@ mp_obj_t mp_obj_new_list(size_t n, mp_obj_t *items) {
     return MP_OBJ_FROM_PTR(o);
 }
 
-void mp_obj_list_get(mp_obj_t self_in, size_t *len, mp_obj_t **items) {
-    mp_obj_list_t *self = MP_OBJ_TO_PTR(self_in);
-    *len = self->len;
-    *items = self->items;
-}
-
-void mp_obj_list_set_len(mp_obj_t self_in, size_t len) {
-    // trust that the caller knows what it's doing
-    // TODO realloc if len got much smaller than alloc
-    mp_obj_list_t *self = MP_OBJ_TO_PTR(self_in);
-    self->len = len;
-}
-
-void mp_obj_list_store(mp_obj_t self_in, mp_obj_t index, mp_obj_t value) {
-    mp_obj_list_t *self = MP_OBJ_TO_PTR(self_in);
-    size_t i = mp_get_index(self->base.type, self->len, index, false);
-    self->items[i] = value;
-}
-
 /******************************************************************************/
 /* list iterator                                                              */
 
@@ -526,4 +519,23 @@ mp_obj_t mp_obj_new_list_iterator(mp_obj_t list, size_t cur, mp_obj_iter_buf_t *
     o->list = list;
     o->cur = cur;
     return MP_OBJ_FROM_PTR(o);
+}
+
+mp_obj_list_t *mp_obj_list_optional_arg(mp_obj_t arg_in, size_t min_len) {
+    if (arg_in == MP_OBJ_NULL || arg_in == mp_const_none) {
+        return MP_OBJ_TO_PTR(mp_obj_new_list(min_len, NULL));
+    } else {
+        return mp_obj_list_ensure(arg_in, min_len);
+    }
+}
+
+mp_obj_list_t *mp_obj_list_ensure(mp_obj_t in, size_t min_len) {
+    if (!mp_obj_is_type(in, &mp_type_list)) {
+        mp_raise_TypeError(NULL);
+    }
+    mp_obj_list_t *list = MP_OBJ_TO_PTR(in);
+    if (list->len < min_len) {
+        mp_raise_ValueError(NULL);
+    }
+    return list;
 }

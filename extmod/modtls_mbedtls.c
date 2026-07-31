@@ -304,7 +304,7 @@ static mp_obj_t ssl_context_make_new(const mp_obj_type_t *type_in, size_t n_args
     psa_crypto_init();
     #endif
 
-    const byte seed[] = "upy";
+    const byte seed[] = "mpy";
     int ret = mbedtls_ctr_drbg_seed(&self->ctr_drbg, mbedtls_entropy_func, &self->entropy, seed, sizeof(seed));
     if (ret != 0) {
         mbedtls_raise_error(ret);
@@ -870,7 +870,14 @@ static mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, i
                 }
             }
         }
-    } else {
+    }
+    #if MICROPY_STREAMS_DELEGATE_ERROR
+    else if (request == MP_STREAM_RAISE_ERROR) {
+        // Raise error with detailed error string
+        mbedtls_raise_error((int)arg);
+    }
+    #endif
+    else {
         // Unsupported ioctl.
         *errcode = MP_EINVAL;
         return MP_STREAM_ERROR;

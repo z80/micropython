@@ -56,6 +56,7 @@ static mp_uint_t mp_reader_vfs_readbyte(void *data) {
             return MP_READER_EOF;
         } else {
             int errcode;
+            mp_event_handle_nowait();
             reader->buflen = mp_stream_rw(reader->file, reader->buf, reader->bufsize, &errcode, MP_STREAM_RW_READ | MP_STREAM_RW_ONCE);
             if (errcode != 0) {
                 // TODO handle errors properly
@@ -83,7 +84,7 @@ void mp_reader_new_file(mp_reader_t *reader, qstr filename) {
     };
     mp_obj_t file = mp_vfs_open(MP_ARRAY_SIZE(args), &args[0], (mp_map_t *)&mp_const_empty_map);
 
-    const mp_stream_p_t *stream_p = mp_get_stream(file);
+    const mp_stream_p_t *stream_p = mp_get_stream_raise(file, MP_STREAM_OP_READ);
     int errcode = 0;
 
     #if MICROPY_VFS_ROM

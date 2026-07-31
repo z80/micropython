@@ -60,6 +60,12 @@ enum {
 // This structure contains dynamic configuration for the compiler.
 #if MICROPY_DYNAMIC_COMPILER
 typedef struct mp_dynamic_compiler_t {
+    // This is used to let mpy-cross pass options to the emitter chosen with
+    // `native_arch`.  The main use case for the time being is to give the
+    // RV32 emitter extended information about which extensions can be
+    // optionally used, in order to generate code that's better suited for the
+    // hardware platform the code will run on.
+    void *backend_options;
     uint8_t small_int_bits; // must be <= host small_int_bits
     uint8_t native_arch;
     uint8_t nlr_buf_num_regs;
@@ -100,6 +106,9 @@ typedef struct _mp_state_mem_area_t {
     size_t gc_alloc_table_byte_len;
     #if MICROPY_ENABLE_FINALISER
     byte *gc_finaliser_table_start;
+    #endif
+    #if MICROPY_PY_WEAKREF
+    byte *gc_weakref_table_start;
     #endif
     byte *gc_pool_start;
     byte *gc_pool_end;

@@ -6,7 +6,6 @@ import sys
 import sysconfig
 import platform
 import argparse
-import inspect
 import json
 import re
 from glob import glob
@@ -15,17 +14,30 @@ from multiprocessing.pool import ThreadPool
 import threading
 import tempfile
 
-# Maximum time to run a single test, in seconds.
-TEST_TIMEOUT = float(os.environ.get("MICROPY_TEST_TIMEOUT", 30))
+from test_utils import (
+    base_path,
+    pyboard,
+    TEST_TIMEOUT,
+    TEST_MAXIMUM_RAW_REPL_FAILURES,
+    MPYCROSS,
+    test_instance_description,
+    test_instance_epilog,
+    test_directory_description,
+    rm_f,
+    normalize_newlines,
+    set_injected_prologue,
+    get_results_filename,
+    convert_device_shortcut_to_real_device,
+    get_test_instance,
+    prepare_script_for_target,
+    create_test_report,
+    FLAKY_REASON_PREFIX,
+)
 
-# See stackoverflow.com/questions/2632199: __file__ nor sys.argv[0]
-# are guaranteed to always work, this one should though.
-BASEPATH = os.path.dirname(os.path.abspath(inspect.getsourcefile(lambda: None)))
-
-
-def base_path(*p):
-    return os.path.abspath(os.path.join(BASEPATH, *p)).replace("\\", "/")
-
+RV32_ARCH_FLAGS = {
+    "zba": 1 << 0,
+    "zcmp": 1 << 1,
+}
 
 # Tests require at least CPython 3.3. If your default python3 executable
 # is of lower version, you can point MICROPY_CPYTHON3 environment var
@@ -35,22 +47,15 @@ if os.name == "nt":
     MICROPYTHON = os.getenv(
         "MICROPY_MICROPYTHON", base_path("../ports/windows/build-standard/micropython.exe")
     )
-    # mpy-cross is only needed if --via-mpy command-line arg is passed
-    MPYCROSS = os.getenv("MICROPY_MPYCROSS", base_path("../mpy-cross/build/mpy-cross.exe"))
 else:
     CPYTHON3 = os.getenv("MICROPY_CPYTHON3", "python3")
     MICROPYTHON = os.getenv(
         "MICROPY_MICROPYTHON", base_path("../ports/unix/build-standard/micropython")
     )
-    # mpy-cross is only needed if --via-mpy command-line arg is passed
-    MPYCROSS = os.getenv("MICROPY_MPYCROSS", base_path("../mpy-cross/build/mpy-cross"))
 
 # Use CPython options to not save .pyc files, to only access the core standard library
 # (not site packages which may clash with u-module names), and improve start up time.
 CPYTHON3_CMD = [CPYTHON3, "-BS"]
-
-# File with the test results.
-RESULTS_FILE = "_results.json"
 
 # For diff'ing test output
 DIFF = os.getenv("MICROPY_DIFF", "diff -u")
@@ -58,53 +63,68 @@ DIFF = os.getenv("MICROPY_DIFF", "diff -u")
 # Set PYTHONIOENCODING so that CPython will use utf-8 on systems which set another encoding in the locale
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
-# Code to allow a target MicroPython to import an .mpy from RAM
-# Note: the module is named `__injected_test` but it needs to have `__name__` set to
-# `__main__` so that the test sees itself as the main module, eg so unittest works.
-injected_import_hook_code = """\
-import sys, os, io, vfs
-class __File(io.IOBase):
-  def __init__(self):
-    module = sys.modules['__injected_test']
-    module.__name__ = '__main__'
-    sys.modules['__main__'] = module
-    self.off = 0
-  def ioctl(self, request, arg):
-    if request == 4: # MP_STREAM_CLOSE
-      return 0
-    return -1
-  def readinto(self, buf):
-    buf[:] = memoryview(__buf)[self.off:self.off + len(buf)]
-    self.off += len(buf)
-    return len(buf)
-class __FS:
-  def mount(self, readonly, mkfs):
-    pass
-  def umount(self):
-    pass
-  def chdir(self, path):
-    pass
-  def getcwd(self):
-    return ""
-  def stat(self, path):
-    if path == '__injected_test.mpy':
-      return tuple(0 for _ in range(10))
-    else:
-      raise OSError(-2) # ENOENT
-  def open(self, path, mode):
-    return __File()
-vfs.mount(__FS(), '/__vfstest')
-os.chdir('/__vfstest')
-{import_prologue}
-__import__('__injected_test')
-"""
-
 # Platforms associated with the unix port, values of `sys.platform`.
 PC_PLATFORMS = ("darwin", "linux", "win32")
+
+# Mapping from `sys.platform` to the port name, for special cases.
+# See `platform_to_port()` function.
+platform_to_port_map = {"pyboard": "stm32", "WiPy": "cc3200"}
+platform_to_port_map.update({p: "unix" for p in PC_PLATFORMS})
+
+# Tests to skip for values of the `--via-mpy` argument.
+via_mpy_tests_to_skip = {
+    # Skip the following when mpy is enabled.
+    True: (
+        # These print out the filename and that's expected to match the .py name.
+        "import/import_file.py",
+        "io/argv.py",
+        "misc/sys_settrace_features.py",
+        "misc/sys_settrace_generator.py",
+        "misc/sys_settrace_loop.py",
+    ),
+}
+
+# Tests to skip for specific emitters.
+emitter_tests_to_skip = {
+    # Some tests are known to fail with native emitter.
+    # Remove them from the below when they work.
+    "native": (
+        # These require raise_varargs.
+        "basics/gen_yield_from_close.py",
+        "basics/try_finally_return2.py",
+        "basics/try_reraise.py",
+        "basics/try_reraise2.py",
+        "misc/features.py",
+        # These require checking for unbound local.
+        "basics/annotate_var.py",
+        "basics/del_deref.py",
+        "basics/del_local.py",
+        "basics/scope_implicit.py",
+        "basics/unboundlocal.py",
+        # These require "raise from".
+        "basics/exception_chain.py",
+        # These require stack-allocated slice optimisation.
+        "micropython/heapalloc_slice.py",
+        # These require implicitly running the scheduler between bytecodes.
+        "micropython/schedule.py",
+        # These require sys.exc_info().
+        "misc/sys_exc_info.py",
+        # These require sys.settrace().
+        "misc/sys_settrace_cov.py",
+        "misc/sys_settrace_features.py",
+        "misc/sys_settrace_generator.py",
+        "misc/sys_settrace_loop.py",
+        # These are bytecode-specific tests.
+        "stress/bytecode_limit.py",
+    ),
+}
 
 # Tests to skip on specific targets.
 # These are tests that are difficult to detect that they should not be run on the given target.
 platform_tests_to_skip = {
+    "esp8266": (
+        "stress/list_sort.py",  # watchdog kicks in because it takes too long
+    ),
     "minimal": (
         "basics/class_inplace_op.py",  # all special methods not supported
         "basics/subclass_native_init.py",  # native subclassing corner cases not support
@@ -135,17 +155,12 @@ platform_tests_to_skip = {
         "thread/thread_lock3.py",
         "thread/thread_shared2.py",
     ),
-    "qemu": (
-        # Skip tests that require Cortex-M4.
-        "inlineasm/thumb/asmfpaddsub.py",
-        "inlineasm/thumb/asmfpcmp.py",
-        "inlineasm/thumb/asmfpldrstr.py",
-        "inlineasm/thumb/asmfpmuldiv.py",
-        "inlineasm/thumb/asmfpsqrt.py",
-    ),
     "webassembly": (
         "basics/string_format_modulo.py",  # can't print nulls to stdout
         "basics/string_strip.py",  # can't print nulls to stdout
+        "basics/weakref_callback_exception.py",  # has different exception printing output
+        "basics/weakref_ref_collect.py",  # requires custom test due to GC behaviour
+        "basics/weakref_finalize_collect.py",  # requires custom test due to GC behaviour
         "extmod/asyncio_basic2.py",
         "extmod/asyncio_cancel_self.py",
         "extmod/asyncio_current_task.py",
@@ -182,10 +197,108 @@ platform_tests_to_skip = {
     ),
 }
 
+# Tests with known intermittent failures. These tests still run, but failures
+# are reclassified as "ignored" instead of "fail" so they don't affect the CI
+# exit code. Paths are relative to the tests/ directory (must match test_file
+# format used by run_one_test, which normalises backslashes to forward slashes).
+#
+# Values are (reason, platforms) tuples where platforms is None (all platforms)
+# or a tuple of sys.platform strings to restrict ignoring to those platforms.
+flaky_tests_to_ignore = {
+    "thread/thread_gc1.py": ("GC race condition", None),
+    "thread/stress_schedule.py": ("intermittent crash under QEMU", None),
+    "thread/stress_recurse.py": ("stack overflow under emulation", None),
+    "thread/stress_heap.py": ("flaky on macOS", ("darwin",)),
+    "cmdline/repl_lock.py": ("REPL timing under QEMU", None),
+    "cmdline/repl_cont.py": ("REPL escaping on macOS", ("darwin",)),
+    "extmod/time_time_ns.py": ("CI runner clock precision", None),
+}
 
-def rm_f(fname):
-    if os.path.exists(fname):
-        os.remove(fname)
+# These tests don't test float explicitly but rather use it to perform the test.
+tests_requiring_float = (
+    "extmod/asyncio_basic.py",
+    "extmod/asyncio_basic2.py",
+    "extmod/asyncio_cancel_task.py",
+    "extmod/asyncio_event.py",
+    "extmod/asyncio_fair.py",
+    "extmod/asyncio_gather.py",
+    "extmod/asyncio_gather_notimpl.py",
+    "extmod/asyncio_get_event_loop.py",
+    "extmod/asyncio_iterator_event.py",
+    "extmod/asyncio_lock.py",
+    "extmod/asyncio_task_done.py",
+    "extmod/asyncio_wait_for.py",
+    "extmod/asyncio_wait_for_fwd.py",
+    "extmod/asyncio_wait_for_linked_task.py",
+    "extmod/asyncio_wait_task.py",
+    "extmod/json_dumps_float.py",
+    "extmod/json_loads_float.py",
+    "extmod/random_extra_float.py",
+    "extmod/select_poll_eintr.py",
+    "extmod/tls_threads.py",
+    "extmod/uctypes_le_float.py",
+    "extmod/uctypes_native_float.py",
+    "extmod/uctypes_sizeof_float.py",
+    "misc/rge_sm.py",
+    "ports/unix/ffi_float.py",
+    "ports/unix/ffi_float2.py",
+)
+
+# These tests don't test slice explicitly but rather use it to perform the test.
+tests_requiring_slice = (
+    "basics/builtin_range.py",
+    "basics/bytearray1.py",
+    "basics/class_super.py",
+    "basics/containment.py",
+    "basics/errno1.py",
+    "basics/fun_str.py",
+    "basics/generator1.py",
+    "basics/globals_del.py",
+    "basics/memoryview1.py",
+    "basics/memoryview_gc.py",
+    "basics/object1.py",
+    "basics/python34.py",
+    "basics/struct_endian.py",
+    "extmod/btree1.py",
+    "extmod/deflate_decompress.py",
+    "extmod/framebuf16.py",
+    "extmod/framebuf4.py",
+    "extmod/machine1.py",
+    "extmod/time_mktime.py",
+    "extmod/time_res.py",
+    "extmod/tls_sslcontext_ciphers.py",
+    "extmod/vfs_fat_fileio1.py",
+    "extmod/vfs_fat_finaliser.py",
+    "extmod/vfs_fat_more.py",
+    "extmod/vfs_fat_ramdisk.py",
+    "extmod/vfs_fat_ramdisklarge.py",
+    "extmod/vfs_lfs.py",
+    "extmod/vfs_rom.py",
+    "float/string_format_modulo.py",
+    "micropython/builtin_execfile.py",
+    "micropython/extreme_exc.py",
+    "micropython/heapalloc_fail_bytearray.py",
+    "micropython/heapalloc_fail_list.py",
+    "micropython/heapalloc_fail_memoryview.py",
+    "micropython/import_mpy_invalid.py",
+    "micropython/import_mpy_native.py",
+    "micropython/import_mpy_native_gc.py",
+    "misc/non_compliant.py",
+    "misc/rge_sm.py",
+)
+
+# Tests that require `import target_wiring` to work.
+tests_requiring_target_wiring = (
+    "extmod/machine_spi_rate.py",
+    "extmod/machine_uart_irq_txidle.py",
+    "extmod/machine_uart_tx.py",
+    "extmod_hardware/machine_can_timings.py",
+    "extmod_hardware/machine_encoder.py",
+    "extmod_hardware/machine_pwm.py",
+    "extmod_hardware/machine_uart_irq_break.py",
+    "extmod_hardware/machine_uart_irq_rx.py",
+    "extmod_hardware/machine_uart_irq_rxidle.py",
+)
 
 
 # unescape wanted regex chars and escape unwanted ones
@@ -208,31 +321,8 @@ def convert_regex_escapes(line):
     return bytes("".join(cs), "utf8")
 
 
-def get_test_instance(test_instance, baudrate, user, password):
-    if test_instance.startswith("port:"):
-        _, port = test_instance.split(":", 1)
-    elif test_instance == "unix":
-        return None
-    elif test_instance == "webassembly":
-        return PyboardNodeRunner()
-    elif test_instance.startswith("a") and test_instance[1:].isdigit():
-        port = "/dev/ttyACM" + test_instance[1:]
-    elif test_instance.startswith("u") and test_instance[1:].isdigit():
-        port = "/dev/ttyUSB" + test_instance[1:]
-    elif test_instance.startswith("c") and test_instance[1:].isdigit():
-        port = "COM" + test_instance[1:]
-    else:
-        # Assume it's a device path.
-        port = test_instance
-
-    global pyboard
-    sys.path.append(base_path("../tools"))
-    import pyboard
-
-    pyb = pyboard.Pyboard(port, baudrate, user, password)
-    pyboard.Pyboard.run_script_on_remote_target = run_script_on_remote_target
-    pyb.enter_raw_repl()
-    return pyb
+def platform_to_port(platform):
+    return platform_to_port_map.get(platform, platform)
 
 
 def detect_inline_asm_arch(pyb, args):
@@ -243,120 +333,112 @@ def detect_inline_asm_arch(pyb, args):
     return None
 
 
+def map_rv32_arch_flags(flags):
+    mapped_flags = []
+    for extension, bit in RV32_ARCH_FLAGS.items():
+        if flags & bit:
+            mapped_flags.append(extension)
+        flags &= ~bit
+    if flags:
+        raise Exception("Unexpected flag bits set in value {}".format(flags))
+    return mapped_flags
+
+
 def detect_test_platform(pyb, args):
     # Run a script to detect various bits of information about the target test instance.
     output = run_feature_check(pyb, args, "target_info.py")
     if output.endswith(b"CRASH"):
         raise ValueError("cannot detect platform: {}".format(output))
-    platform, arch, thread = str(output, "ascii").strip().split()
+    platform, arch, arch_flags, build, thread, float_prec, unicode = (
+        str(output, "ascii").strip().split()
+    )
     if arch == "None":
         arch = None
     inlineasm_arch = detect_inline_asm_arch(pyb, args)
     if thread == "None":
         thread = None
+    float_prec = int(float_prec)
+    unicode = unicode == "True"
+    if arch == "rv32imc":
+        arch_flags = map_rv32_arch_flags(int(arch_flags))
+    else:
+        arch_flags = None
 
     args.platform = platform
     args.arch = arch
+    args.arch_flags = arch_flags
     if arch and not args.mpy_cross_flags:
         args.mpy_cross_flags = "-march=" + arch
+        if arch_flags:
+            args.mpy_cross_flags += " -march-flags=" + ",".join(arch_flags)
     args.inlineasm_arch = inlineasm_arch
+    args.build = build
     args.thread = thread
+    args.float_prec = float_prec
+    args.unicode = unicode
 
+    # Print the detected information about the target.
     print("platform={}".format(platform), end="")
     if arch:
         print(" arch={}".format(arch), end="")
+        if arch_flags:
+            print(" arch_flags={}".format(",".join(arch_flags)), end="")
     if inlineasm_arch:
         print(" inlineasm={}".format(inlineasm_arch), end="")
     if thread:
         print(" thread={}".format(thread), end="")
-    print()
+    if float_prec:
+        print(" float={}-bit".format(float_prec), end="")
+    if unicode:
+        print(" unicode", end="")
 
 
-def prepare_script_for_target(args, *, script_text=None, force_plain=False):
-    if force_plain or (not args.via_mpy and args.emit == "bytecode"):
-        # A plain test to run as-is, no processing needed.
-        pass
-    elif args.via_mpy:
-        tempname = tempfile.mktemp(dir="")
-        mpy_filename = tempname + ".mpy"
-
-        script_filename = tempname + ".py"
-        with open(script_filename, "wb") as f:
-            f.write(script_text)
-
-        try:
-            subprocess.check_output(
-                [MPYCROSS]
-                + args.mpy_cross_flags.split()
-                + ["-o", mpy_filename, "-X", "emit=" + args.emit, script_filename],
-                stderr=subprocess.STDOUT,
-            )
-        except subprocess.CalledProcessError as er:
-            return True, b"mpy-cross crash\n" + er.output
-
-        with open(mpy_filename, "rb") as f:
-            script_text = b"__buf=" + bytes(repr(f.read()), "ascii") + b"\n"
-
-        rm_f(mpy_filename)
-        rm_f(script_filename)
-
-        script_text += bytes(injected_import_hook_code, "ascii")
+def detect_target_wiring_script(pyb, args):
+    tw_data = b""
+    tw_source = None
+    if args.target_wiring:
+        # A target_wiring path is explicitly provided, so use that.
+        tw_source = args.target_wiring
+        with open(tw_source, "rb") as f:
+            tw_data = f.read()
+    elif hasattr(pyb, "exec_raw") and pyb.exec_raw("import target_wiring") == (b"", b""):
+        # The board already has a target_wiring module available, so use that.
+        tw_source = "on-device"
     else:
-        print("error: using emit={} must go via .mpy".format(args.emit))
-        sys.exit(1)
-
-    return False, script_text
-
-
-def run_script_on_remote_target(pyb, args, test_file, is_special):
-    with open(test_file, "rb") as f:
-        script = f.read()
-
-    # If the test is not a special test, prepend it with a print to indicate that it started.
-    # If the print does not execute this means that the test did not even start, eg it was
-    # too large for the target.
-    prepend_start_test = not is_special
-    if prepend_start_test:
-        if script.startswith(b"#"):
-            script = b"print('START TEST')" + script
-        else:
-            script = b"print('START TEST')\n" + script
-
-    had_crash, script = prepare_script_for_target(args, script_text=script, force_plain=is_special)
-
-    if had_crash:
-        return True, script
-
-    try:
-        had_crash = False
-        pyb.enter_raw_repl()
-        output_mupy = pyb.exec_(script, timeout=TEST_TIMEOUT)
-    except pyboard.PyboardError as e:
-        had_crash = True
-        if not is_special and e.args[0] == "exception":
-            if prepend_start_test and e.args[1] == b"" and b"MemoryError" in e.args[2]:
-                output_mupy = b"SKIP-TOO-LARGE\n"
-            else:
-                output_mupy = e.args[1] + e.args[2] + b"CRASH"
-        else:
-            output_mupy = bytes(e.args[0], "ascii") + b"\nCRASH"
-
-    if prepend_start_test:
-        if output_mupy.startswith(b"START TEST\r\n"):
-            output_mupy = output_mupy.removeprefix(b"START TEST\r\n")
-        else:
-            had_crash = True
-
-    return had_crash, output_mupy
+        port = platform_to_port(args.platform)
+        build = args.build
+        tw_board_exact = None
+        tw_board_partial = None
+        tw_port = None
+        for file in os.listdir("target_wiring"):
+            file_base = file.removesuffix(".py")
+            if file_base == build:
+                # A file matching the target's board/build name.
+                tw_board_exact = file
+            elif file_base.endswith("x") and build.startswith(file_base.removesuffix("x")):
+                # A file with a partial match to the target's board/build name.
+                tw_board_partial = file
+            elif file_base == port:
+                # A file matching the target's port.
+                tw_port = file
+        tw_source = tw_board_exact or tw_board_partial or tw_port
+        if tw_source:
+            with open("target_wiring/" + tw_source, "rb") as f:
+                tw_data = f.read()
+    if tw_source:
+        print(" target_wiring={}".format(tw_source), end="")
+    pyb.target_wiring_script = tw_data
 
 
-special_tests = [
+tests_with_regex_output = [
     base_path(file)
     for file in (
         "micropython/meminfo.py",
         "basics/bytes_compare3.py",
         "basics/builtin_help.py",
+        "basics/weakref_callback_exception.py",
         "misc/sys_settrace_cov.py",
+        "net_inet/tls_text_errors.py",
         "thread/thread_exc2.py",
         "ports/esp32/partition_ota.py",
     )
@@ -367,10 +449,7 @@ def run_micropython(pyb, args, test_file, test_file_abspath, is_special=False):
     had_crash = False
     if pyb is None:
         # run on PC
-        if (
-            test_file_abspath.startswith((base_path("cmdline/"), base_path("feature_check/")))
-            or test_file_abspath in special_tests
-        ):
+        if test_file_abspath.startswith((base_path("cmdline/"), base_path("feature_check/"))):
             # special handling for tests of the unix cmdline program
             is_special = True
 
@@ -487,12 +566,13 @@ def run_micropython(pyb, args, test_file, test_file_abspath, is_special=False):
 
     else:
         # run via pyboard interface
+        requires_target_wiring = test_file.endswith(tests_requiring_target_wiring)
         had_crash, output_mupy = pyb.run_script_on_remote_target(
-            args, test_file_abspath, is_special
+            args, test_file_abspath, is_special, requires_target_wiring
         )
 
     # canonical form for all ports/platforms is to use \n for end-of-line
-    output_mupy = output_mupy.replace(b"\r\n", b"\n")
+    output_mupy = normalize_newlines(output_mupy)
 
     # don't try to convert the output if we should skip this test
     if had_crash or output_mupy in (b"SKIP\n", b"SKIP-TOO-LARGE\n", b"CRASH"):
@@ -502,7 +582,7 @@ def run_micropython(pyb, args, test_file, test_file_abspath, is_special=False):
     if is_special and not had_crash and b"\nSKIP\n" in output_mupy:
         return b"SKIP\n"
 
-    if is_special or test_file_abspath in special_tests:
+    if is_special or test_file_abspath in tests_with_regex_output:
         # convert parts of the output that are not stable across runs
         with open(test_file + ".exp", "rb") as f:
             lines_exp = []
@@ -578,53 +658,9 @@ class ThreadSafeCounter:
         return self._value
 
 
-class PyboardNodeRunner:
-    def __init__(self):
-        mjs = os.getenv("MICROPY_MICROPYTHON_MJS")
-        if mjs is None:
-            mjs = base_path("../ports/webassembly/build-standard/micropython.mjs")
-        else:
-            mjs = os.path.abspath(mjs)
-        self.micropython_mjs = mjs
-
-    def close(self):
-        pass
-
-    def run_script_on_remote_target(self, args, test_file, is_special):
-        cwd = os.path.dirname(test_file)
-
-        # Create system command list.
-        cmdlist = ["node"]
-        if test_file.endswith(".py"):
-            # Run a Python script indirectly via "node micropython.mjs <script.py>".
-            cmdlist.append(self.micropython_mjs)
-            if args.heapsize is not None:
-                cmdlist.extend(["-X", "heapsize=" + args.heapsize])
-            cmdlist.append(test_file)
-        else:
-            # Run a js/mjs script directly with Node, passing in the path to micropython.mjs.
-            cmdlist.append(test_file)
-            cmdlist.append(self.micropython_mjs)
-
-        # Run the script.
-        try:
-            had_crash = False
-            output_mupy = subprocess.check_output(
-                cmdlist, stderr=subprocess.STDOUT, timeout=TEST_TIMEOUT, cwd=cwd
-            )
-        except subprocess.CalledProcessError as er:
-            had_crash = True
-            output_mupy = er.output + b"CRASH"
-        except subprocess.TimeoutExpired as er:
-            had_crash = True
-            output_mupy = (er.output or b"") + b"TIMEOUT"
-
-        # Return the results.
-        return had_crash, output_mupy
-
-
 def run_tests(pyb, tests, args, result_dir, num_threads=1):
     testcase_count = ThreadSafeCounter()
+    raw_repl_failure_count = ThreadSafeCounter()
     test_results = ThreadSafeCounter([])
 
     skip_tests = set()
@@ -637,14 +673,12 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
     skip_async = False
     skip_const = False
     skip_revops = False
-    skip_io_module = False
     skip_fstring = False
+    skip_tstring = False
     skip_endian = False
     skip_inlineasm = False
     has_complex = True
     has_coverage = False
-
-    upy_float_precision = 32
 
     if True:
         # Even if we run completely different tests in a different directory,
@@ -696,15 +730,15 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
         if output == b"TypeError\n":
             skip_revops = True
 
-        # Check if io module exists, and skip such tests if it doesn't
-        output = run_feature_check(pyb, args, "io_module.py")
-        if output != b"io\n":
-            skip_io_module = True
-
         # Check if fstring feature is enabled, and skip such tests if it doesn't
         output = run_feature_check(pyb, args, "fstring.py")
         if output != b"a=1\n":
             skip_fstring = True
+
+        # Check if tstring feature is enabled, and skip such tests if it doesn't
+        output = run_feature_check(pyb, args, "tstring.py")
+        if output != b"tstring\n":
+            skip_tstring = True
 
         if args.inlineasm_arch == "thumb":
             # Check if @micropython.asm_thumb supports Thumb2 instructions, and skip such tests if it doesn't
@@ -714,13 +748,25 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
                 skip_tests.add("inlineasm/thumb/asmbitops.py")
                 skip_tests.add("inlineasm/thumb/asmconst.py")
                 skip_tests.add("inlineasm/thumb/asmdiv.py")
+                skip_tests.add("inlineasm/thumb/asmit.py")
+                skip_tests.add("inlineasm/thumb/asmspecialregs.py")
+            if args.arch not in ("armv7emsp", "armv7emdp"):
                 skip_tests.add("inlineasm/thumb/asmfpaddsub.py")
                 skip_tests.add("inlineasm/thumb/asmfpcmp.py")
                 skip_tests.add("inlineasm/thumb/asmfpldrstr.py")
                 skip_tests.add("inlineasm/thumb/asmfpmuldiv.py")
                 skip_tests.add("inlineasm/thumb/asmfpsqrt.py")
-                skip_tests.add("inlineasm/thumb/asmit.py")
-                skip_tests.add("inlineasm/thumb/asmspecialregs.py")
+
+        if args.inlineasm_arch == "rv32":
+            # Discover extension-specific inlineasm tests and add them to the
+            # list of tests to run if applicable.
+            for extension in RV32_ARCH_FLAGS:
+                try:
+                    output = run_feature_check(pyb, args, "inlineasm_rv32_{}.py".format(extension))
+                    if output.strip() != "rv32_{}".format(extension).encode():
+                        skip_tests.add("inlineasm/rv32/asm_ext_{}.py".format(extension))
+                except FileNotFoundError:
+                    pass
 
         # Check if emacs repl is supported, and skip such tests if it's not
         t = run_feature_check(pyb, args, "repl_emacs_check.py")
@@ -733,11 +779,6 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
             skip_tests.add("cmdline/repl_words_move.py")
 
         upy_byteorder = run_feature_check(pyb, args, "byteorder.py")
-        upy_float_precision = run_feature_check(pyb, args, "float.py")
-        try:
-            upy_float_precision = int(upy_float_precision)
-        except ValueError:
-            upy_float_precision = 0
         has_complex = run_feature_check(pyb, args, "complex.py") == b"complex\n"
         has_coverage = run_feature_check(pyb, args, "coverage.py") == b"coverage\n"
         cpy_byteorder = subprocess.check_output(
@@ -747,41 +788,15 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
 
         skip_inlineasm = args.inlineasm_arch is None
 
-    # These tests don't test slice explicitly but rather use it to perform the test
-    misc_slice_tests = (
-        "builtin_range",
-        "bytearray1",
-        "class_super",
-        "containment",
-        "errno1",
-        "fun_str",
-        "generator1",
-        "globals_del",
-        "memoryview1",
-        "memoryview_gc",
-        "object1",
-        "python34",
-        "string_format_modulo",
-        "struct_endian",
-    )
-
     # Some tests shouldn't be run on GitHub Actions
     if os.getenv("GITHUB_ACTIONS") == "true":
-        skip_tests.add("thread/stress_schedule.py")  # has reliability issues
-
         if os.getenv("RUNNER_OS") == "Windows" and os.getenv("CI_BUILD_CONFIGURATION") == "Debug":
             # fails with stack overflow on Debug builds
             skip_tests.add("misc/sys_settrace_features.py")
 
-    if upy_float_precision == 0:
-        skip_tests.add("extmod/uctypes_le_float.py")
-        skip_tests.add("extmod/uctypes_native_float.py")
-        skip_tests.add("extmod/uctypes_sizeof_float.py")
-        skip_tests.add("extmod/json_dumps_float.py")
-        skip_tests.add("extmod/json_loads_float.py")
-        skip_tests.add("extmod/random_extra_float.py")
-        skip_tests.add("misc/rge_sm.py")
-    if upy_float_precision < 32:
+    if args.float_prec == 0:
+        skip_tests.update(tests_requiring_float)
+    if args.float_prec < 32:
         skip_tests.add(
             "float/float2int_intbig.py"
         )  # requires fp32, there's float2int_fp30_intbig.py instead
@@ -791,16 +806,23 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
         skip_tests.add("float/bytes_construct.py")  # requires fp32
         skip_tests.add("float/bytearray_construct.py")  # requires fp32
         skip_tests.add("float/float_format_ints_power10.py")  # requires fp32
-    if upy_float_precision < 64:
+    if args.float_prec < 64:
         skip_tests.add("float/float_divmod.py")  # tested by float/float_divmod_relaxed.py instead
         skip_tests.add("float/float2int_doubleprec_intbig.py")
         skip_tests.add("float/float_struct_e_doubleprec.py")
         skip_tests.add("float/float_format_ints_doubleprec.py")
         skip_tests.add("float/float_parse_doubleprec.py")
 
+    if not args.unicode:
+        skip_tests.add("extmod/json_loads.py")  # tests loading a utf-8 character
+
+    if skip_slice:
+        skip_tests.update(tests_requiring_slice)
+
     if not has_complex:
         skip_tests.add("float/complex1.py")
         skip_tests.add("float/complex1_intbig.py")
+        skip_tests.add("float/complex1_micropython.py")
         skip_tests.add("float/complex_reverse_op.py")
         skip_tests.add("float/complex_special_methods.py")
         skip_tests.add("float/int_big_float.py")
@@ -823,6 +845,15 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
     if args.platform not in PC_PLATFORMS:
         skip_tests.add("basics/exception_chain.py")  # warning is not printed
         skip_tests.add("micropython/meminfo.py")  # output is very different to PC output
+        skip_tests.add("unicode/file1.py")  # requires local file access
+        skip_tests.add("unicode/file2.py")  # requires local file access
+        skip_tests.add("unicode/file_invalid.py")  # requires local file access
+
+    # Skip certain tests when going via a .mpy file.
+    skip_tests.update(via_mpy_tests_to_skip.get(args.via_mpy, ()))
+
+    # Skip emitter-specific tests.
+    skip_tests.update(emitter_tests_to_skip.get(args.emit, ()))
 
     # Skip platform-specific tests.
     skip_tests.update(platform_tests_to_skip.get(args.platform, ()))
@@ -837,49 +868,23 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
             # Works but CPython uses '\' path separator
             skip_tests.add("import/import_file.py")
 
-    # Some tests are known to fail with native emitter
-    # Remove them from the below when they work
-    if args.emit == "native":
-        skip_tests.add("basics/gen_yield_from_close.py")  # require raise_varargs
-        skip_tests.update(
-            {"basics/%s.py" % t for t in "try_reraise try_reraise2".split()}
-        )  # require raise_varargs
-        skip_tests.add("basics/annotate_var.py")  # requires checking for unbound local
-        skip_tests.add("basics/del_deref.py")  # requires checking for unbound local
-        skip_tests.add("basics/del_local.py")  # requires checking for unbound local
-        skip_tests.add("basics/exception_chain.py")  # raise from is not supported
-        skip_tests.add("basics/scope_implicit.py")  # requires checking for unbound local
-        skip_tests.add("basics/sys_tracebacklimit.py")  # requires traceback info
-        skip_tests.add("basics/try_finally_return2.py")  # requires raise_varargs
-        skip_tests.add("basics/unboundlocal.py")  # requires checking for unbound local
-        skip_tests.add("misc/features.py")  # requires raise_varargs
-        skip_tests.add(
-            "misc/print_exception.py"
-        )  # because native doesn't have proper traceback info
-        skip_tests.add("misc/sys_exc_info.py")  # sys.exc_info() is not supported for native
-        skip_tests.add("misc/sys_settrace_features.py")  # sys.settrace() not supported
-        skip_tests.add("misc/sys_settrace_generator.py")  # sys.settrace() not supported
-        skip_tests.add("misc/sys_settrace_loop.py")  # sys.settrace() not supported
-        skip_tests.add(
-            "micropython/emg_exc.py"
-        )  # because native doesn't have proper traceback info
-        skip_tests.add(
-            "micropython/heapalloc_slice.py"
-        )  # because native doesn't do the stack-allocated slice optimisation
-        skip_tests.add(
-            "micropython/heapalloc_traceback.py"
-        )  # because native doesn't have proper traceback info
-        skip_tests.add(
-            "micropython/opt_level_lineno.py"
-        )  # native doesn't have proper traceback info
-        skip_tests.add("micropython/schedule.py")  # native code doesn't check pending events
-        skip_tests.add("stress/bytecode_limit.py")  # bytecode specific test
-        skip_tests.add("extmod/asyncio_event_queue.py")  # native can't run schedule
-        skip_tests.add("extmod/asyncio_iterator_event.py")  # native can't run schedule
+    skip_tests = [os.path.realpath(base_path(skip_test)) for skip_test in skip_tests]
 
     def run_one_test(test_file):
-        test_file = test_file.replace("\\", "/")
         test_file_abspath = os.path.abspath(test_file).replace("\\", "/")
+        # If test_file is one of our own tests always make it relative to our tests/ dir and
+        # otherwise use the abosulte path, irregardless of actual path passed,
+        # such that display and result output is always the same.
+        try:
+            test_file_relpath = os.path.relpath(test_file, start=base_path())
+            if not test_file_relpath.startswith(".."):
+                test_file = test_file_relpath
+            else:
+                test_file = test_file_abspath
+        except ValueError:
+            # Path on different drive on Windows.
+            test_file = test_file_abspath
+        test_file = test_file.replace("\\", "/")
 
         if args.filters:
             # Default verdict is the opposite of the first action
@@ -902,14 +907,14 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
         is_int_64 = test_name.startswith("int_64") or test_name.endswith("_int64")
         is_bytearray = test_name.startswith("bytearray") or test_name.endswith("_bytearray")
         is_set_type = test_name.startswith(("set_", "frozenset")) or test_name.endswith("_set")
-        is_slice = test_name.find("slice") != -1 or test_name in misc_slice_tests
+        is_slice = test_name.find("slice") != -1
         is_async = test_name.startswith(("async_", "asyncio_")) or test_name.endswith("_async")
         is_const = test_name.startswith("const")
-        is_io_module = test_name.startswith("io_")
         is_fstring = test_name.startswith("string_fstring")
+        is_tstring = test_name.startswith("string_tstring") or test_name.endswith("_tstring")
         is_inlineasm = test_name.startswith("asm")
 
-        skip_it = test_file in skip_tests
+        skip_it = os.path.realpath(test_file) in skip_tests
         skip_it |= skip_native and is_native
         skip_it |= skip_endian and is_endian
         skip_it |= skip_int_big and is_int_big
@@ -920,13 +925,17 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
         skip_it |= skip_async and is_async
         skip_it |= skip_const and is_const
         skip_it |= skip_revops and "reverse_op" in test_name
-        skip_it |= skip_io_module and is_io_module
         skip_it |= skip_fstring and is_fstring
+        skip_it |= skip_tstring and is_tstring
         skip_it |= skip_inlineasm and is_inlineasm
 
         if skip_it:
             print("skip ", test_file)
             test_results.append((test_file, "skip", ""))
+            return
+        elif args.dry_run:
+            print("found", test_file)
+            test_results.append((test_file, "found", ""))
             return
 
         # Run the test on the MicroPython target.
@@ -982,7 +991,11 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
             # Expected output is result of running unittest.
             output_expected = None
         else:
-            test_file_expected = test_file + ".exp"
+            # Prefer emitter-specific expected output.
+            test_file_expected = test_file + "." + args.emit + ".exp"
+            if not os.path.isfile(test_file_expected):
+                # Fall back to generic expected output.
+                test_file_expected = test_file + ".exp"
             if os.path.isfile(test_file_expected):
                 # Expected output given by a file, so read that in.
                 with open(test_file_expected, "rb") as f:
@@ -1032,6 +1045,9 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
             rm_f(filename_expected)
             rm_f(filename_mupy)
         else:
+            if output_mupy.startswith(b"could not enter raw repl"):
+                extra_info = "raw REPL failed"
+                raw_repl_failure_count.increment()
             print("FAIL ", test_file, extra_info)
             if output_expected is not None:
                 with open(filename_expected, "wb") as f:
@@ -1062,77 +1078,26 @@ def run_tests(pyb, tests, args, result_dir, num_threads=1):
         else:
             for test in tests:
                 run_one_test(test)
+                if raw_repl_failure_count.value > TEST_MAXIMUM_RAW_REPL_FAILURES:
+                    print("Too many raw REPL failures, aborting test run")
+                    break
     except TestError as er:
         for line in er.args[0]:
             print(line)
-        sys.exit(1)
+        sys.exit(2)
+
+    # Reclassify known-flaky test failures as ignored.
+    # Safe to mutate: thread pool has joined.
+    results = test_results.value
+    for i, r in enumerate(results):
+        if r[1] == "fail":
+            reason, platforms = flaky_tests_to_ignore.get(r[0], (None, None))
+            if reason is not None:
+                if platforms is None or sys.platform in platforms:
+                    results[i] = (r[0], "ignored", "{}: {}".format(FLAKY_REASON_PREFIX, reason))
 
     # Return test results.
     return test_results.value, testcase_count.value
-
-
-# Print a summary of the results and save them to a JSON file.
-# Returns True if everything succeeded, False otherwise.
-def create_test_report(args, test_results, testcase_count=None):
-    passed_tests = list(r for r in test_results if r[1] == "pass")
-    skipped_tests = list(r for r in test_results if r[1] == "skip" and r[2] != "too large")
-    skipped_tests_too_large = list(
-        r for r in test_results if r[1] == "skip" and r[2] == "too large"
-    )
-    failed_tests = list(r for r in test_results if r[1] == "fail")
-
-    num_tests_performed = len(passed_tests) + len(failed_tests)
-
-    testcase_count_info = ""
-    if testcase_count is not None:
-        testcase_count_info = " ({} individual testcases)".format(testcase_count)
-    print("{} tests performed{}".format(num_tests_performed, testcase_count_info))
-
-    print("{} tests passed".format(len(passed_tests)))
-
-    if len(skipped_tests) > 0:
-        print(
-            "{} tests skipped: {}".format(
-                len(skipped_tests), " ".join(test[0] for test in skipped_tests)
-            )
-        )
-
-    if len(skipped_tests_too_large) > 0:
-        print(
-            "{} tests skipped because they are too large: {}".format(
-                len(skipped_tests_too_large), " ".join(test[0] for test in skipped_tests_too_large)
-            )
-        )
-
-    if len(failed_tests) > 0:
-        print(
-            "{} tests failed: {}".format(
-                len(failed_tests), " ".join(test[0] for test in failed_tests)
-            )
-        )
-
-    # Serialize regex added by append_filter.
-    def to_json(obj):
-        if isinstance(obj, re.Pattern):
-            return obj.pattern
-        return obj
-
-    with open(os.path.join(args.result_dir, RESULTS_FILE), "w") as f:
-        json.dump(
-            {
-                # The arguments passed on the command-line.
-                "args": vars(args),
-                # A list of all results of the form [(test, result, reason), ...].
-                "results": list(test for test in test_results),
-                # A list of failed tests.  This is deprecated, use the "results" above instead.
-                "failed_tests": [test[0] for test in failed_tests],
-            },
-            f,
-            default=to_json,
-        )
-
-    # Return True only if all tests succeeded.
-    return len(failed_tests) == 0
 
 
 class append_filter(argparse.Action):
@@ -1149,39 +1114,7 @@ class append_filter(argparse.Action):
         args.filters.append((option, re.compile(value)))
 
 
-test_instance_description = """\
-By default the tests are run against the unix port of MicroPython. To run it
-against something else, use the -t option.  See below for details.
-"""
-test_instance_epilog = """\
-The -t option accepts the following for the test instance:
-- unix - use the unix port of MicroPython, specified by the MICROPY_MICROPYTHON
-  environment variable (which defaults to the standard variant of either the unix
-  or windows ports, depending on the host platform)
-- webassembly - use the webassembly port of MicroPython, specified by the
-  MICROPY_MICROPYTHON_MJS environment variable (which defaults to the standard
-  variant of the webassembly port)
-- port:<device> - connect to and use the given serial port device
-- a<n> - connect to and use /dev/ttyACM<n>
-- u<n> - connect to and use /dev/ttyUSB<n>
-- c<n> - connect to and use COM<n>
-- exec:<command> - execute a command and attach to its stdin/stdout
-- execpty:<command> - execute a command and attach to the printed /dev/pts/<n> device
-- <a>.<b>.<c>.<d> - connect to the given IPv4 address
-- anything else specifies a serial port
-"""
-
-test_directory_description = """\
-Tests are discovered by scanning test directories for .py files or using the
-specified test files. If test files nor directories are specified, the script
-expects to be ran in the tests directory (where this file is located) and the
-builtin tests suitable for the target platform are ran.
-"""
-
-
 def main():
-    global injected_import_hook_code
-
     cmd_parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=f"""Run and manage tests for MicroPython.
@@ -1190,8 +1123,8 @@ def main():
 {test_directory_description}
 
 When running tests, run-tests.py compares the MicroPython output of the test with the output
-produced by running the test through CPython unless a <test>.exp file is found, in which
-case it is used as comparison.
+produced by running the test through CPython unless a <test>.exp file is found (or a
+<test>.native.exp file when using the native emitter), in which case it is used as comparison.
 
 If a test fails, run-tests.py produces a pair of <test>.out and <test>.exp files in the result
 directory with the MicroPython output and the expectations, respectively.
@@ -1237,6 +1170,11 @@ the last matching regex is used:
         help="include test by regex on path/name.py",
     )
     cmd_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show tests which would run (though might still be skipped at runtime)",
+    )
+    cmd_parser.add_argument(
         "--emit", default="bytecode", help="MicroPython emitter to use (bytecode or native)"
     )
     cmd_parser.add_argument("--heapsize", help="heapsize to use (use default if not specified)")
@@ -1277,13 +1215,18 @@ the last matching regex is used:
         default=None,
         help="prologue python file to execute before module import",
     )
+    cmd_parser.add_argument(
+        "--target-wiring",
+        default=None,
+        help="force the given script to be used as target_wiring.py",
+    )
     args = cmd_parser.parse_args()
 
     prologue = ""
     if args.begin:
         with open(args.begin, "rt") as source:
             prologue = source.read()
-    injected_import_hook_code = injected_import_hook_code.replace("{import_prologue}", prologue)
+    set_injected_prologue(prologue)
 
     if args.print_failures:
         for out in glob(os.path.join(args.result_dir, "*.out")):
@@ -1306,7 +1249,7 @@ the last matching regex is used:
             os.path.join(args.result_dir, "*.out")
         ):
             os.remove(f)
-        rm_f(os.path.join(args.result_dir, RESULTS_FILE))
+        rm_f(get_results_filename(args))
 
         sys.exit(0)
 
@@ -1322,7 +1265,7 @@ the last matching regex is used:
         )
 
     if args.run_failures:
-        results_file = os.path.join(args.result_dir, RESULTS_FILE)
+        results_file = get_results_filename(args)
         if os.path.exists(results_file):
             with open(results_file, "r") as f:
                 tests = list(test[0] for test in json.load(f)["results"] if test[1] == "fail")
@@ -1333,64 +1276,67 @@ the last matching regex is used:
         if args.platform == "webassembly":
             test_extensions += ("*.js", "*.mjs")
 
-        if args.test_dirs is None:
+        all_test_dirs = []
+        main_tests_dir_in_args = None
+        if args.test_dirs is not None:
+            # Run tests from given directories though if user explicitly passes this directory as argument
+            # still do the normal test discovery to be consistent with running from within this directory.
+            main_tests_dir = os.path.realpath(base_path())
+            for test_dir in args.test_dirs:
+                if os.path.realpath(test_dir) == main_tests_dir:
+                    main_tests_dir_in_args = test_dir
+                else:
+                    all_test_dirs.append(test_dir)
+
+        if args.test_dirs is None or main_tests_dir_in_args is not None:
             test_dirs = (
                 "basics",
                 "micropython",
                 "misc",
                 "extmod",
+                "stress",
             )
             if args.inlineasm_arch is not None:
                 test_dirs += ("inlineasm/{}".format(args.inlineasm_arch),)
             if args.thread is not None:
                 test_dirs += ("thread",)
-            if args.platform == "pyboard":
-                # run pyboard tests
-                test_dirs += ("float", "stress", "ports/stm32")
-            elif args.platform == "mimxrt":
-                test_dirs += ("float", "stress")
-            elif args.platform == "renesas-ra":
-                test_dirs += ("float", "ports/renesas-ra")
-            elif args.platform == "rp2":
-                test_dirs += ("float", "stress", "ports/rp2")
-            elif args.platform == "esp32":
-                test_dirs += ("float", "stress")
-            elif args.platform in ("esp8266", "minimal", "samd", "nrf"):
+            if args.float_prec > 0:
                 test_dirs += ("float",)
-            elif args.platform == "WiPy":
-                # run WiPy tests
-                test_dirs += ("ports/cc3200",)
-            elif args.platform in PC_PLATFORMS:
+            if args.unicode:
+                test_dirs += ("unicode",)
+            port_specific_test_dir = "ports/{}".format(platform_to_port(args.platform))
+            if os.path.isdir(port_specific_test_dir):
+                test_dirs += (port_specific_test_dir,)
+            if args.platform in PC_PLATFORMS:
                 # run PC tests
-                test_dirs += (
-                    "float",
-                    "import",
-                    "io",
-                    "stress",
-                    "unicode",
-                    "cmdline",
-                    "ports/unix",
-                )
-            elif args.platform == "qemu":
-                test_dirs += (
-                    "float",
-                    "ports/qemu",
-                )
-            elif args.platform == "webassembly":
-                test_dirs += ("float", "ports/webassembly")
-        else:
-            # run tests from these directories
-            test_dirs = args.test_dirs
+                test_dirs += ("import",)
+                if args.build != "minimal":
+                    test_dirs += ("cmdline", "io")
+
+            all_test_dirs.extend(
+                test_dir
+                if main_tests_dir_in_args is None
+                else os.path.join(main_tests_dir_in_args, test_dir)
+                for test_dir in test_dirs
+            )
+
         tests = sorted(
             test_file
             for test_files in (
-                glob(os.path.join(dir, ext)) for dir in test_dirs for ext in test_extensions
+                glob(os.path.join(dir, ext)) for dir in all_test_dirs for ext in test_extensions
             )
             for test_file in test_files
         )
     else:
         # tests explicitly given
         tests = args.files
+
+    # If any tests need it, prepare the target_wiring script for the target.
+    if pyb and any(test.endswith(tests_requiring_target_wiring) for test in tests):
+        detect_target_wiring_script(pyb, args)
+
+    # End the target information line.
+    print()
 
     if not args.keep_path:
         # Clear search path to make sure tests use only builtin modules, those in

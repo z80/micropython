@@ -15,7 +15,13 @@ import itertools
 import subprocess
 import tempfile
 
-run_tests_module = __import__("run-tests")
+from test_utils import (
+    base_path,
+    pyboard,
+    test_instance_epilog,
+    convert_device_shortcut_to_real_device,
+    create_test_report,
+)
 
 test_dir = os.path.abspath(os.path.dirname(__file__))
 
@@ -23,9 +29,6 @@ if os.path.abspath(sys.path[0]) == test_dir:
     # remove the micropython/tests dir from path to avoid
     # accidentally importing tests like micropython/const.py
     sys.path.pop(0)
-
-sys.path.insert(0, test_dir + "/../tools")
-import pyboard
 
 if os.name == "nt":
     CPYTHON3 = os.getenv("MICROPY_CPYTHON3", "python3.exe")
@@ -238,17 +241,8 @@ class PyInstanceSubProcess(PyInstance):
 
 
 class PyInstancePyboard(PyInstance):
-    @staticmethod
-    def map_device_shortcut(device):
-        if device[0] == "a" and device[1:].isdigit():
-            return "/dev/ttyACM" + device[1:]
-        elif device[0] == "u" and device[1:].isdigit():
-            return "/dev/ttyUSB" + device[1:]
-        else:
-            return device
-
     def __init__(self, device):
-        device = self.map_device_shortcut(device)
+        device = device
         self.device = device
         self.pyb = pyboard.Pyboard(device)
         self.pyb.enter_raw_repl()
@@ -282,19 +276,22 @@ class PyInstancePyboard(PyInstance):
     def readline(self):
         if self.finished:
             return None, None
-        if self.pyb.serial.inWaiting() == 0:
-            return None, None
-        out = self.pyb.read_until(1, (b"\r\n", b"\x04"))
-        if out.endswith(b"\x04"):
-            self.finished = True
-            out = out[:-1]
-            err = decode(self.pyb.read_until(1, b"\x04"))
-            err = err[:-1]
-            if not out and not err:
+        try:
+            if self.pyb.serial.inWaiting() == 0:
                 return None, None
-        else:
-            err = None
-        return decode(out.rstrip()), err
+            out = self.pyb.read_until(1, (b"\r\n", b"\x04"))
+            if out.endswith(b"\x04"):
+                self.finished = True
+                out = out[:-1]
+                err = decode(self.pyb.read_until(1, b"\x04"))
+                err = err[:-1]
+                if not out and not err:
+                    return None, None
+            else:
+                err = None
+            return decode(out.rstrip()), err
+        except OSError as e:
+            return None, "Failed to read from instance: {}".format(e)
 
     def write(self, data):
         self.pyb.serial.write(data)
@@ -440,7 +437,10 @@ def run_test_on_instances(test_file, num_instances, instances):
 
     # Stop all instances
     for idx in range(num_instances):
-        instances[idx].stop()
+        try:
+            instances[idx].stop()
+        except OSError as e:
+            output[idx].append("Runner failed to stop instance: {}".format(e))
 
     output_str = ""
     for idx, lines in enumerate(output):
@@ -562,16 +562,24 @@ def main():
 
     cmd_parser = argparse.ArgumentParser(
         description="Run network tests for MicroPython",
+        epilog=(
+            test_instance_epilog
+            + "Each instance arg can optionally have custom env provided, eg. <cmd>,ENV=VAR,ENV=VAR...\n"
+        ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
     cmd_parser.add_argument(
         "-s", "--show-output", action="store_true", help="show test output after running"
     )
     cmd_parser.add_argument(
-        "-t", "--trace-output", action="store_true", help="trace test output while running"
+        "-c", "--trace-output", action="store_true", help="trace test output while running"
     )
     cmd_parser.add_argument(
-        "-i", "--instance", action="append", default=[], help="instance(s) to run the tests on"
+        "-t",
+        "--test-instance",
+        action="append",
+        default=[],
+        help="instance(s) to run the tests on",
     )
     cmd_parser.add_argument(
         "-p",
@@ -583,16 +591,8 @@ def main():
     cmd_parser.add_argument(
         "-r",
         "--result-dir",
-        default=run_tests_module.base_path("results"),
+        default=base_path("results"),
         help="directory for test results",
-    )
-    cmd_parser.epilog = (
-        "Supported instance types:\r\n"
-        " -i pyb:<port>   physical device (eg. pyboard) on provided repl port.\n"
-        " -i micropython  unix micropython instance, path customised with MICROPY_MICROPYTHON env.\n"
-        " -i cpython      desktop python3 instance, path customised with MICROPY_CPYTHON3 env.\n"
-        " -i exec:<path>  custom program run on provided path.\n"
-        "Each instance arg can optionally have custom env provided, eg. <cmd>,ENV=VAR,ENV=VAR...\n"
     )
     cmd_parser.add_argument("files", nargs="+", help="input test files")
     cmd_args = cmd_parser.parse_args()
@@ -606,22 +606,23 @@ def main():
     instances_truth = [PyInstanceSubProcess([PYTHON_TRUTH]) for _ in range(max_instances)]
 
     instances_test = []
-    for i in cmd_args.instance:
+    for i in cmd_args.test_instance:
         # Each instance arg is <cmd>,ENV=VAR,ENV=VAR...
         i = i.split(",")
         cmd = i[0]
         env = i[1:]
         if cmd.startswith("exec:"):
             instances_test.append(PyInstanceSubProcess([cmd[len("exec:") :]], env))
-        elif cmd == "micropython":
+        elif cmd == "unix":
             instances_test.append(PyInstanceSubProcess([MICROPYTHON], env))
         elif cmd == "cpython":
             instances_test.append(PyInstanceSubProcess([CPYTHON3], env))
-        elif cmd.startswith("pyb:"):
-            instances_test.append(PyInstancePyboard(cmd[len("pyb:") :]))
+        elif cmd == "webassembly" or cmd.startswith("execpty:"):
+            print("unsupported instance string: {}".format(cmd), file=sys.stderr)
+            sys.exit(2)
         else:
-            print("unknown instance string: {}".format(cmd), file=sys.stderr)
-            sys.exit(1)
+            device = convert_device_shortcut_to_real_device(cmd)
+            instances_test.append(PyInstancePyboard(device))
 
     for _ in range(max_instances - len(instances_test)):
         instances_test.append(PyInstanceSubProcess([MICROPYTHON]))
@@ -634,7 +635,7 @@ def main():
                 break
 
             test_results = run_tests(test_files, instances_truth, instances_test_permutation)
-            all_pass &= run_tests_module.create_test_report(cmd_args, test_results)
+            all_pass &= create_test_report(cmd_args, test_results)
 
     finally:
         for i in instances_truth:

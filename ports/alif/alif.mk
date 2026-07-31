@@ -22,13 +22,14 @@ include $(TOP)/extmod/extmod.mk
 ################################################################################
 # Project specific settings and compiler/linker flags
 
+MPY_CROSS_FLAGS += -march=armv7emdp
+
 CROSS_COMPILE ?= arm-none-eabi-
 ALIF_DFP_REL_TOP ?= lib/alif_ensemble-cmsis-dfp
 ALIF_DFP_REL_HERE ?= $(TOP)/lib/alif_ensemble-cmsis-dfp
 CMSIS_DIR ?= $(TOP)/lib/cmsis/inc
 
 MCU_CORE ?= M55_HP
-ALIF_CONFIG ?= mcu/$(MCU_CORE)_cfg.json
 LD_FILE ?= mcu/ensemble.ld.S
 
 INC += -I.

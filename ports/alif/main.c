@@ -29,7 +29,6 @@
 #include "py/gc.h"
 #include "py/mperrno.h"
 #include "py/mphal.h"
-#include "py/stackctrl.h"
 #include "extmod/modbluetooth.h"
 #include "extmod/modmachine.h"
 #include "extmod/modnetwork.h"
@@ -39,6 +38,7 @@
 #include "shared/runtime/softtimer.h"
 #include "shared/tinyusb/mp_usbd.h"
 #include "tusb.h"
+#include "modmachine.h"
 #include "mpbthciport.h"
 #include "mpuart.h"
 #include "ospi_flash.h"
@@ -56,6 +56,7 @@
 
 extern uint8_t __StackTop, __StackLimit;
 extern uint8_t __GcHeapStart, __GcHeapEnd;
+extern void machine_pwm_deinit_all(void);
 extern void machine_pin_irq_deinit(void);
 
 MP_NORETURN void panic(const char *msg) {
@@ -78,6 +79,8 @@ int main(void) {
 
     MICROPY_BOARD_EARLY_INIT();
 
+    machine_rtc_init();
+
     #if MICROPY_HW_ENABLE_UART_REPL
     mp_uart_init_repl();
     #endif
@@ -92,8 +95,7 @@ int main(void) {
     #endif
 
     // Initialise stack extents and GC heap.
-    mp_stack_set_top(&__StackTop);
-    mp_stack_set_limit(&__StackTop - &__StackLimit - 1024);
+    mp_cstack_init_with_top(&__StackTop, &__StackTop - &__StackLimit);
     gc_init(&__GcHeapStart, &__GcHeapEnd);
 
     #if MICROPY_PY_LWIP
@@ -169,6 +171,7 @@ int main(void) {
         mp_machine_i2c_target_deinit_all();
         #endif
         soft_timer_deinit();
+        machine_pwm_deinit_all();
         machine_pin_irq_deinit();
         gc_sweep_all();
         mp_deinit();

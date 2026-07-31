@@ -24,42 +24,14 @@
  * THE SOFTWARE.
  */
 
-#include "py/obj.h"
+#include "py/mphal.h"
 #include "se_services.h"
 #include "mbedtls_config_port.h"
 
 #if defined(MBEDTLS_HAVE_TIME)
-#include "shared/timeutils/timeutils.h"
-#include "mbedtls/platform_time.h"
-#endif
-
-int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t *olen) {
-    uint32_t val = 0;
-    int n = 0;
-    *olen = len;
-    while (len--) {
-        if (!n) {
-            val = se_services_rand64();
-            n = 4;
-        }
-        *output++ = val;
-        val >>= 8;
-        --n;
-    }
-    return 0;
-}
-
-#if defined(MBEDTLS_HAVE_TIME)
 
 time_t alif_mbedtls_time(time_t *timer) {
-    // TODO implement proper RTC time
-    unsigned int year = 2025;
-    unsigned int month = 1;
-    unsigned int date = 1;
-    unsigned int hours = 12;
-    unsigned int minutes = 0;
-    unsigned int seconds = 0;
-    return timeutils_seconds_since_epoch(year, month, date, hours, minutes, seconds);
+    return mp_hal_time_get(NULL);
 }
 
 #endif

@@ -123,7 +123,7 @@ void mp_init(void) {
     MP_STATE_VM(mp_module_builtins_override_dict) = NULL;
     #endif
 
-    #if MICROPY_EMIT_MACHINE_CODE && (MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA || MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA)
+    #if (MICROPY_EMIT_INLINE_ASM || MICROPY_ENABLE_NATIVE_CODE) && (MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA || MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA)
     MP_STATE_VM(persistent_code_root_pointers) = MP_OBJ_NULL;
     #endif
 
@@ -177,6 +177,10 @@ void mp_init(void) {
 
     #if MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE
     MP_STATE_VM(usbd) = MP_OBJ_NULL;
+    #endif
+
+    #if MICROPY_PY_WEAKREF
+    mp_map_init(&MP_STATE_VM(mp_weakref_map), 0);
     #endif
 
     #if MICROPY_PY_THREAD_GIL
@@ -430,7 +434,7 @@ mp_obj_t MICROPY_WRAP_MP_BINARY_OP(mp_binary_op)(mp_binary_op_t op, mp_obj_t lhs
             // Operations that can overflow:
             //      +       result always fits in mp_int_t, then handled by SMALL_INT check
             //      -       result always fits in mp_int_t, then handled by SMALL_INT check
-            //      *       checked explicitly
+            //      *       checked explicitly for fit in mp_int_t, then handled by SMALL_INT check
             //      /       if lhs=MIN and rhs=-1; result always fits in mp_int_t, then handled by SMALL_INT check
             //      %       if lhs=MIN and rhs=-1; result always fits in mp_int_t, then handled by SMALL_INT check
             //      <<      checked explicitly
@@ -489,31 +493,16 @@ mp_obj_t MICROPY_WRAP_MP_BINARY_OP(mp_binary_op)(mp_binary_op_t op, mp_obj_t lhs
                     break;
                 case MP_BINARY_OP_MULTIPLY:
                 case MP_BINARY_OP_INPLACE_MULTIPLY: {
-
-                    // If long long type exists and is larger than mp_int_t, then
-                    // we can use the following code to perform overflow-checked multiplication.
-                    // Otherwise (eg in x64 case) we must use mp_small_int_mul_overflow.
-                    #if 0
-                    // compute result using long long precision
-                    long long res = (long long)lhs_val * (long long)rhs_val;
-                    if (res > MP_SMALL_INT_MAX || res < MP_SMALL_INT_MIN) {
-                        // result overflowed SMALL_INT, so return higher precision integer
-                        return mp_obj_new_int_from_ll(res);
-                    } else {
-                        // use standard precision
-                        lhs_val = (mp_int_t)res;
-                    }
-                    #endif
-
                     mp_int_t int_res;
-                    if (mp_small_int_mul_overflow(lhs_val, rhs_val, &int_res)) {
+                    if (mp_mul_mp_int_t_overflow(lhs_val, rhs_val, &int_res)) {
                         // use higher precision
                         lhs = mp_obj_new_int_from_ll(lhs_val);
                         goto generic_binary_op;
                     } else {
                         // use standard precision
-                        return MP_OBJ_NEW_SMALL_INT(int_res);
+                        lhs_val = int_res;
                     }
+                    break;
                 }
                 case MP_BINARY_OP_FLOOR_DIVIDE:
                 case MP_BINARY_OP_INPLACE_FLOOR_DIVIDE:
@@ -553,7 +542,7 @@ mp_obj_t MICROPY_WRAP_MP_BINARY_OP(mp_binary_op)(mp_binary_op_t op, mp_obj_t lhs
                         mp_int_t ans = 1;
                         while (rhs_val > 0) {
                             if (rhs_val & 1) {
-                                if (mp_small_int_mul_overflow(ans, lhs_val, &ans)) {
+                                if (mp_mul_mp_int_t_overflow(ans, lhs_val, &ans)) {
                                     goto power_overflow;
                                 }
                             }
@@ -562,7 +551,7 @@ mp_obj_t MICROPY_WRAP_MP_BINARY_OP(mp_binary_op)(mp_binary_op_t op, mp_obj_t lhs
                             }
                             rhs_val /= 2;
                             mp_int_t int_res;
-                            if (mp_small_int_mul_overflow(lhs_val, lhs_val, &int_res)) {
+                            if (mp_mul_mp_int_t_overflow(lhs_val, lhs_val, &int_res)) {
                                 goto power_overflow;
                             }
                             lhs_val = int_res;
@@ -1523,7 +1512,7 @@ mp_obj_t mp_make_raise_obj(mp_obj_t o) {
     }
 
     if (mp_obj_is_exception_instance(o)) {
-        // o is an instance of an exception, so use it as the exception
+        // o is a fully-constructed instance of an exception, so use it as the exception
         return o;
     } else {
         // o cannot be used as an exception, so return a type error (which will be raised by the caller)
@@ -1537,7 +1526,7 @@ mp_obj_t mp_import_name(qstr name, mp_obj_t fromlist, mp_obj_t level) {
     // build args array
     mp_obj_t args[5];
     args[0] = MP_OBJ_NEW_QSTR(name);
-    args[1] = mp_const_none; // TODO should be globals
+    args[1] = MP_OBJ_FROM_PTR(mp_globals_get()); // globals of the current context
     args[2] = mp_const_none; // TODO should be locals
     args[3] = fromlist;
     args[4] = level;
@@ -1562,14 +1551,11 @@ mp_obj_t mp_import_from(mp_obj_t module, qstr name) {
     mp_obj_t dest[2];
 
     mp_load_method_maybe(module, name, dest);
-
     if (dest[1] != MP_OBJ_NULL) {
-        // Hopefully we can't import bound method from an object
-    import_error:
-        mp_raise_msg_varg(&mp_type_ImportError, MP_ERROR_TEXT("can't import name %q"), name);
-    }
-
-    if (dest[0] != MP_OBJ_NULL) {
+        // Importing a bound method from a class instance.
+        return mp_obj_new_bound_meth(dest[0], dest[1]);
+    } else if (dest[0] != MP_OBJ_NULL) {
+        // Importing a function or attribute.
         return dest[0];
     }
 
@@ -1602,24 +1588,27 @@ mp_obj_t mp_import_from(mp_obj_t module, qstr name) {
     goto import_error;
 
     #endif
+
+import_error:
+    mp_raise_msg_varg(&mp_type_ImportError, MP_ERROR_TEXT("can't import name %q"), name);
 }
 
 void mp_import_all(mp_obj_t module) {
     DEBUG_printf("import all %p\n", module);
 
-    mp_map_t *map = &mp_obj_module_get_globals(module)->map;
+    mp_obj_t dest[2];
 
     #if MICROPY_MODULE___ALL__
-    mp_map_elem_t *elem = mp_map_lookup(map, MP_OBJ_NEW_QSTR(MP_QSTR___all__), MP_MAP_LOOKUP);
-    if (elem != NULL) {
+
+    mp_load_method_maybe(module, MP_QSTR___all__, dest);
+    if (dest[0] != MP_OBJ_NULL) {
         // When __all__ is defined, we must explicitly load all specified
         // symbols, possibly invoking the module __getattr__ function
         size_t len;
         mp_obj_t *items;
-        mp_obj_get_array(elem->value, &len, &items);
+        mp_obj_get_array(dest[0], &len, &items);
         for (size_t i = 0; i < len; i++) {
             qstr qname = mp_obj_str_get_qstr(items[i]);
-            mp_obj_t dest[2];
             mp_load_method(module, qname, dest);
             mp_store_name(qname, dest[0]);
         }
@@ -1627,8 +1616,19 @@ void mp_import_all(mp_obj_t module) {
     }
     #endif
 
+    #if MICROPY_CPYTHON_COMPAT
+    // Load the dict from the module.  In MicroPython, if __dict__ is
+    // available then it always returns a native mp_obj_dict_t instance.
+    mp_load_method(module, MP_QSTR___dict__, dest);
+    #else
+    // Without MICROPY_CPYTHON_COMPAT __dict__ is not available, so just
+    // assume the given module is actually an mp_obj_module_t instance.
+    dest[0] = MP_OBJ_FROM_PTR(mp_obj_module_get_globals(module));
+    #endif
+
     // By default, the set of public names includes all names found in the module's
     // namespace which do not begin with an underscore character ('_')
+    mp_map_t *map = mp_obj_dict_get_map(dest[0]);
     for (size_t i = 0; i < map->alloc; i++) {
         if (mp_map_slot_is_filled(map, i)) {
             // Entry in module global scope may be generated programmatically
@@ -1684,14 +1684,14 @@ mp_obj_t mp_parse_compile_execute(mp_lexer_t *lex, mp_parse_input_kind_t parse_i
 #endif // MICROPY_ENABLE_COMPILER
 
 MP_NORETURN void m_malloc_fail(size_t num_bytes) {
-    DEBUG_printf("memory allocation failed, allocating %u bytes\n", (uint)num_bytes);
+    DEBUG_printf("memory allocation failed, allocating " SIZE_FMT " bytes\n", num_bytes);
     #if MICROPY_ENABLE_GC
     if (gc_is_locked()) {
         mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("memory allocation failed, heap is locked"));
     }
     #endif
     mp_raise_msg_varg(&mp_type_MemoryError,
-        MP_ERROR_TEXT("memory allocation failed, allocating %u bytes"), (uint)num_bytes);
+        MP_ERROR_TEXT("memory allocation failed, allocating " SIZE_FMT " bytes"), num_bytes);
 }
 
 #if MICROPY_ERROR_REPORTING == MICROPY_ERROR_REPORTING_NONE
