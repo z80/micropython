@@ -205,14 +205,129 @@ STATIC mp_obj_t mp_nrf24_open_rx_pipe(mp_obj_t self_in, mp_obj_t pipe_in, mp_obj
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_3(nrf24_open_rx_pipe_obj, mp_nrf24_open_rx_pipe);
 
+
+/* ---------- Additional Method Wrappers ---------- */
+
+STATIC mp_obj_t mp_nrf24_power_up(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_power_up(&self->nrf);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_power_up_obj, mp_nrf24_power_up);
+
+STATIC mp_obj_t mp_nrf24_power_down(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_power_down(&self->nrf);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_power_down_obj, mp_nrf24_power_down);
+
+STATIC mp_obj_t mp_nrf24_set_power_speed(mp_obj_t self_in, mp_obj_t power_in, mp_obj_t speed_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_set_power_speed(&self->nrf, (uint8_t)mp_obj_get_int(power_in), (uint8_t)mp_obj_get_int(speed_in));
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_3(nrf24_set_power_speed_obj, mp_nrf24_set_power_speed);
+
+STATIC mp_obj_t mp_nrf24_set_channel(mp_obj_t self_in, mp_obj_t channel_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_set_channel(&self->nrf, (uint8_t)mp_obj_get_int(channel_in));
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(nrf24_set_channel_obj, mp_nrf24_set_channel);
+
+STATIC mp_obj_t mp_nrf24_reg_read(mp_obj_t self_in, mp_obj_t reg_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    uint8_t val = nrf24_reg_read(&self->nrf, (uint8_t)mp_obj_get_int(reg_in));
+    return MP_OBJ_NEW_SMALL_INT(val);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(nrf24_reg_read_obj, mp_nrf24_reg_read);
+
+STATIC mp_obj_t mp_nrf24_reg_write(mp_obj_t self_in, mp_obj_t reg_in, mp_obj_t val_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    uint8_t res = nrf24_reg_write(&self->nrf, (uint8_t)mp_obj_get_int(reg_in), (uint8_t)mp_obj_get_int(val_in));
+    return MP_OBJ_NEW_SMALL_INT(res);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_3(nrf24_reg_write_obj, mp_nrf24_reg_write);
+
+STATIC mp_obj_t mp_nrf24_read_status(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    return MP_OBJ_NEW_SMALL_INT(nrf24_read_status(&self->nrf));
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_read_status_obj, mp_nrf24_read_status);
+
+STATIC mp_obj_t mp_nrf24_flush_rx(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_flush_rx(&self->nrf);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_flush_rx_obj, mp_nrf24_flush_rx);
+
+STATIC mp_obj_t mp_nrf24_flush_tx(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_flush_tx(&self->nrf);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_flush_tx_obj, mp_nrf24_flush_tx);
+
+STATIC mp_obj_t mp_nrf24_send_start(mp_obj_t self_in, mp_obj_t data_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(data_in, &bufinfo, MP_BUFFER_READ);
+    nrf24_send_start(&self->nrf, bufinfo.buf, bufinfo.len);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(nrf24_send_start_obj, mp_nrf24_send_start);
+
+STATIC mp_obj_t mp_nrf24_send_done(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    return MP_OBJ_NEW_SMALL_INT(nrf24_send_done(&self->nrf));
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_send_done_obj, mp_nrf24_send_done);
+
+STATIC mp_obj_t mp_nrf24_abort_send(mp_obj_t self_in) {
+    mp_nrf24_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    nrf24_abort_send(&self->nrf);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(nrf24_abort_send_obj, mp_nrf24_abort_send);
+
+
 STATIC const mp_rom_map_elem_t nrf24_locals[] = {
+    // Core API & Power
+    { MP_ROM_QSTR(MP_QSTR_power_up), MP_ROM_PTR(&nrf24_power_up_obj) },
+    { MP_ROM_QSTR(MP_QSTR_power_down), MP_ROM_PTR(&nrf24_power_down_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_power_speed), MP_ROM_PTR(&nrf24_set_power_speed_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_channel), MP_ROM_PTR(&nrf24_set_channel_obj) },
+    { MP_ROM_QSTR(MP_QSTR_open_tx_pipe), MP_ROM_PTR(&nrf24_open_tx_pipe_obj) },
+    { MP_ROM_QSTR(MP_QSTR_open_rx_pipe), MP_ROM_PTR(&nrf24_open_rx_pipe_obj) },
+
+    // RX / TX
     { MP_ROM_QSTR(MP_QSTR_start_listening), MP_ROM_PTR(&nrf24_start_listening_obj) },
     { MP_ROM_QSTR(MP_QSTR_stop_listening), MP_ROM_PTR(&nrf24_stop_listening_obj) },
     { MP_ROM_QSTR(MP_QSTR_any), MP_ROM_PTR(&nrf24_any_obj) },
     { MP_ROM_QSTR(MP_QSTR_recv), MP_ROM_PTR(&nrf24_recv_obj) },
     { MP_ROM_QSTR(MP_QSTR_send), MP_ROM_PTR(&nrf24_send_obj) },
-    { MP_ROM_QSTR(MP_QSTR_open_tx_pipe), MP_ROM_PTR(&nrf24_open_tx_pipe_obj) },
-    { MP_ROM_QSTR(MP_QSTR_open_rx_pipe), MP_ROM_PTR(&nrf24_open_rx_pipe_obj) },
+    { MP_ROM_QSTR(MP_QSTR_send_start), MP_ROM_PTR(&nrf24_send_start_obj) },
+    { MP_ROM_QSTR(MP_QSTR_send_done), MP_ROM_PTR(&nrf24_send_done_obj) },
+    { MP_ROM_QSTR(MP_QSTR_abort_send), MP_ROM_PTR(&nrf24_abort_send_obj) },
+
+    // Internal / Register functions
+    { MP_ROM_QSTR(MP_QSTR_reg_read), MP_ROM_PTR(&nrf24_reg_read_obj) },
+    { MP_ROM_QSTR(MP_QSTR_reg_write), MP_ROM_PTR(&nrf24_reg_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_status), MP_ROM_PTR(&nrf24_read_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_flush_rx), MP_ROM_PTR(&nrf24_flush_rx_obj) },
+    { MP_ROM_QSTR(MP_QSTR_flush_tx), MP_ROM_PTR(&nrf24_flush_tx_obj) },
+
+    // Constants (adjust values to match your nrf24.h definitions)
+    { MP_ROM_QSTR(MP_QSTR_SPEED_250k), MP_ROM_INT(NRF24_SPEED_250K) },
+    { MP_ROM_QSTR(MP_QSTR_SPEED_1M),   MP_ROM_INT(NRF24_SPEED_1M) },
+    { MP_ROM_QSTR(MP_QSTR_SPEED_2M),   MP_ROM_INT(NRF24_SPEED_2M) },
+    
+    { MP_ROM_QSTR(MP_QSTR_POWER_0),    MP_ROM_INT(NRF24_POWER_0) },
+    { MP_ROM_QSTR(MP_QSTR_POWER_1),    MP_ROM_INT(NRF24_POWER_1) },
+    { MP_ROM_QSTR(MP_QSTR_POWER_2),    MP_ROM_INT(NRF24_POWER_2) },
+    { MP_ROM_QSTR(MP_QSTR_POWER_3),    MP_ROM_INT(NRF24_POWER_3) },
 };
 STATIC MP_DEFINE_CONST_DICT(nrf24_locals_dict, nrf24_locals);
 
