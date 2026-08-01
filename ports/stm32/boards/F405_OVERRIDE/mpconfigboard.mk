@@ -13,7 +13,6 @@ MICROPY_VFS_FAT  = 1
 #MICROPY_VFS_LFS1 = 0
 #MICROPY_VFS_LFS2 = 1
 
-#USER_C_MODULES = $(TOP)/examples/usercmodule
-USER_C_MODULES = $(BOARD_DIR)
-
+# User modules are described by drivers/micropython.mk.
+USER_C_MODULES = $(BOARD_DIR)/drivers
 
