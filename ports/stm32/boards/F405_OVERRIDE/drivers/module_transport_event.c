@@ -18,7 +18,7 @@ STATIC mp_transport_event_obj_t *transport_event_from_obj(mp_obj_t event_in) {
 
 STATIC void transport_event_require_valid(mp_transport_event_obj_t *self) {
     if (!self->valid) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("event not valid"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("event not valid"));
     }
 }
 

@@ -73,7 +73,7 @@ STATIC mp_nrf24_obj_t *nrf24_obj_checked(mp_obj_t object) {
 STATIC mp_nrf24_obj_t *nrf24_obj_for_python(mp_obj_t object) {
     mp_nrf24_obj_t *self = nrf24_obj_checked(object);
     if (self->native_owner != NULL) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("radio in use"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("radio in use"));
     }
     return self;
 }

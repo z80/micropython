@@ -91,7 +91,7 @@ STATIC mp_transport_core_obj_t *transport_core_from_obj(mp_obj_t self_in) {
     }
     mp_transport_core_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (self->closed) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("core closed"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("core closed"));
     }
     return self;
 }
@@ -317,13 +317,15 @@ STATIC mp_obj_t transport_core_make_new(const mp_obj_type_t *type,
             (uint16_t)args[ARG_ard_us].u_int,
             (uint8_t)args[ARG_arc].u_int) ||
             !transport_core_radio_io_ok(&self->hardware)) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("radio initialization failed"));
+        mp_raise_msg(&mp_type_RuntimeError,
+            MP_ERROR_TEXT("radio initialization failed"));
     }
     if (nrf24_reg_read(&self->radio, NRF24_REG_SETUP_AW) != 0x03 ||
             nrf24_reg_read(&self->radio, NRF24_REG_RF_CH) !=
                 (uint8_t)args[ARG_channel].u_int ||
             !transport_core_radio_io_ok(&self->hardware)) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("radio not responding"));
+        mp_raise_msg(&mp_type_RuntimeError,
+            MP_ERROR_TEXT("radio not responding"));
     }
 
     config.radio.radio = &self->radio;
@@ -392,7 +394,7 @@ STATIC mp_obj_t mp_transport_core_start(mp_obj_t self_in) {
     mp_transport_core_obj_t *self = transport_core_from_obj(self_in);
     transport_stm32_clear_error(&self->hardware);
     if (!transport_core_start(&self->core)) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("core start failed"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("core start failed"));
     }
     nrf24_set_irq_sources(&self->radio, NRF24_STATUS_RX_DR |
         NRF24_STATUS_TX_DS | NRF24_STATUS_MAX_RT);
@@ -403,7 +405,8 @@ STATIC mp_obj_t mp_transport_core_start(mp_obj_t self_in) {
             !transport_stm32_register_irq(&self->hardware,
                 transport_core_radio_irq, self)) {
         transport_core_stop_hardware(self);
-        mp_raise_RuntimeError(MP_ERROR_TEXT("radio IRQ start failed"));
+        mp_raise_msg(&mp_type_RuntimeError,
+            MP_ERROR_TEXT("radio IRQ start failed"));
     }
     return mp_const_none;
 }
@@ -456,7 +459,7 @@ STATIC mp_obj_t mp_transport_core_send_command(size_t n_args,
     mp_buffer_info_t data;
     size_t maximum = 0;
     if (!self->core.started) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("core not started"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("core not started"));
     }
     if (destination < 0 || destination >= TRANSPORT_CORE_INVALID_ID ||
             destination == self->core.config.node_id || message_id < 0 ||
@@ -494,7 +497,7 @@ STATIC mp_obj_t mp_transport_core_send_registration(size_t n_args,
     mp_buffer_info_t data;
     size_t expected_length;
     if (!self->core.started) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("core not started"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("core not started"));
     }
     if (destination < 0 || destination > 0xff || message_id < 0 ||
             message_id > 0xff ||
@@ -526,7 +529,8 @@ STATIC mp_obj_t mp_transport_core_set_node_id(mp_obj_t self_in,
         mp_raise_ValueError(MP_ERROR_TEXT("invalid node id"));
     }
     if (!transport_core_set_node_id(&self->core, (uint8_t)node_id)) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("core busy or address failed"));
+        mp_raise_msg(&mp_type_RuntimeError,
+            MP_ERROR_TEXT("core busy or address failed"));
     }
     return mp_const_none;
 }
@@ -540,7 +544,7 @@ STATIC mp_obj_t mp_transport_core_open_pipe(mp_obj_t self_in,
     mp_int_t stream_id = mp_obj_get_int(stream_id_in);
     int slot;
     if (!self->core.started) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("core not started"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("core not started"));
     }
     if (destination < 0 || destination >= TRANSPORT_CORE_INVALID_ID ||
             destination == self->core.config.node_id || stream_id < 0 ||
@@ -568,7 +572,7 @@ STATIC mp_obj_t mp_transport_core_pipe_write(mp_obj_t self_in,
             (pipe->state != TRANSPORT_PIPE_TX_INTENT_QUEUED &&
              pipe->state != TRANSPORT_PIPE_TX_WAIT_CTS &&
              pipe->state != TRANSPORT_PIPE_TX_OPEN)) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("pipe not writable"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("pipe not writable"));
     }
     mp_get_buffer_raise(data_in, &data, MP_BUFFER_READ);
     return mp_obj_new_int_from_uint(transport_core_pipe_tx_write(&self->core,
@@ -585,7 +589,7 @@ STATIC mp_obj_t mp_transport_core_close_pipe(mp_obj_t self_in,
         mp_raise_ValueError(MP_ERROR_TEXT("invalid pipe slot"));
     }
     if (!transport_core_close_pipe(&self->core, (uint8_t)slot)) {
-        mp_raise_RuntimeError(MP_ERROR_TEXT("pipe not open"));
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("pipe not open"));
     }
     return mp_const_none;
 }
