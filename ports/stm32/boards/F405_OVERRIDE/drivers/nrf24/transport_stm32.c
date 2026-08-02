@@ -108,8 +108,16 @@ bool transport_stm32_init(transport_stm32_t *adapter, mp_obj_t spi_obj,
         adapter->error = TRANSPORT_STM32_ERROR_SPI_CONFIGURATION;
         return false;
     }
-    if (spi->spi->State == HAL_SPI_STATE_RESET ||
-            (spi->spi->Instance->CR1 & SPI_CR1_SPE) == 0) {
+    if (spi->spi->State != HAL_SPI_STATE_READY) {
+        adapter->error = TRANSPORT_STM32_ERROR_SPI_NOT_READY;
+        return false;
+    }
+
+    /* HAL_SPI_Init() leaves the peripheral configured but disabled.  HAL's
+       transfer functions enable it lazily; this adapter accesses DR directly,
+       so enable the already configured peripheral here. */
+    __HAL_SPI_ENABLE(spi->spi);
+    if ((spi->spi->Instance->CR1 & SPI_CR1_SPE) == 0) {
         adapter->error = TRANSPORT_STM32_ERROR_SPI_NOT_READY;
         return false;
     }
