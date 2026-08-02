@@ -302,7 +302,19 @@ STATIC mp_obj_t transport_core_make_new(const mp_obj_type_t *type,
 
     if (!transport_stm32_init(&self->hardware, self->spi_obj, self->cs_obj,
             self->ce_obj, self->irq_obj)) {
-        mp_raise_ValueError(MP_ERROR_TEXT("invalid transport hardware"));
+        switch (transport_stm32_get_error(&self->hardware)) {
+            case TRANSPORT_STM32_ERROR_ARGUMENT:
+                mp_raise_ValueError(
+                    MP_ERROR_TEXT("transport hardware pins conflict"));
+            case TRANSPORT_STM32_ERROR_SPI_CONFIGURATION:
+                mp_raise_ValueError(
+                    MP_ERROR_TEXT("unsupported SPI configuration"));
+            case TRANSPORT_STM32_ERROR_SPI_NOT_READY:
+                mp_raise_ValueError(MP_ERROR_TEXT("SPI not ready"));
+            default:
+                mp_raise_ValueError(
+                    MP_ERROR_TEXT("invalid transport hardware"));
+        }
     }
     self->radio.spi_transfer = transport_radio_spi_transfer;
     self->radio.csn_set = transport_radio_cs_write;
