@@ -323,6 +323,9 @@ int main(void) {
     make_cts(packet, config.network_id, 9, 1, 30, TRANSPORT_WIRE_COMMAND,
         TRANSPORT_CTS_ACCEPTED, sizeof(outbound));
     deliver(&core, packet);
+    assert(!core.tx.active);
+    fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+    transport_core_service(&core);
     assert(core.tx.kind == TRANSPORT_TX_COMMAND);
     assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) ==
         TRANSPORT_WIRE_MAX_DATA);
@@ -360,6 +363,8 @@ int main(void) {
     make_cts(packet, config.network_id, 9, 1, 31, TRANSPORT_WIRE_COMMAND,
         TRANSPORT_CTS_ACCEPTED, 0);
     deliver(&core, packet);
+    fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+    transport_core_service(&core);
     assert(core.tx.kind == TRANSPORT_TX_COMMAND);
     assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 0);
     assert((captured_tx[4] & TRANSPORT_WIRE_LAST_PACKET) != 0);
@@ -415,6 +420,8 @@ int main(void) {
     make_cts(packet, config.network_id, 9, 1, 34, TRANSPORT_WIRE_COMMAND,
         TRANSPORT_CTS_ACCEPTED, sizeof(first));
     deliver(&core, packet);
+    fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+    transport_core_service(&core);
     for (i = 0; i < config.max_rt_restarts; ++i) {
         fake_status |= NRF24_STATUS_MAX_RT;
         transport_core_on_radio_irq(&core);
@@ -434,6 +441,35 @@ int main(void) {
 
     assert(core.stats.commands_sent == 2);
     assert(core.stats.commands_failed == 4);
+
+    /* An unbounded restart count is still bounded by the retry window. */
+    core.config.max_rt_restarts = TRANSPORT_CORE_RESTARTS_UNBOUNDED;
+    assert(transport_core_send_command(&core, 9, TRANSPORT_WIRE_COMMAND,
+        35, first, sizeof(first)));
+    ack_tx(&core);
+    make_cts(packet, config.network_id, 9, 1, 35, TRANSPORT_WIRE_COMMAND,
+        TRANSPORT_CTS_ACCEPTED, sizeof(first));
+    deliver(&core, packet);
+    fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+    transport_core_service(&core);
+    for (i = 0; i < 5; ++i) {
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(core.tx.active);
+    }
+    fake_now += config.max_rt_window_ms;
+    fake_status |= NRF24_STATUS_MAX_RT;
+    transport_core_on_radio_irq(&core);
+    assert(!core.tx.active);
+    assert(transport_core_poll_into(&core, event_buffer, sizeof(event_buffer),
+        &event_length, &required) == TRANSPORT_POLL_EVENT);
+    assert(transport_event_get_type(event_buffer) ==
+        TRANSPORT_EVENT_COMMAND_FAILED);
+    assert(transport_core_poll_into(&core, event_buffer, sizeof(event_buffer),
+        &event_length, &required) == TRANSPORT_POLL_EVENT);
+    assert(transport_event_get_type(event_buffer) ==
+        TRANSPORT_EVENT_CORE_ERROR);
+    core.config.max_rt_restarts = config.max_rt_restarts;
 
     /* Outbound streams reserve the receiver first, consume cumulative
        credits only after TX_DS, and drain before sending the final marker. */
@@ -455,6 +491,9 @@ int main(void) {
         make_cts(packet, config.network_id, 9, 1, 40,
             TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, 32);
         deliver(&core, packet);
+        assert(!core.tx.active);
+        fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
         assert(core.tx.kind == TRANSPORT_TX_PIPE);
         assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 26);
         assert(memcmp(captured_tx + TRANSPORT_WIRE_HEADER_SIZE, outbound,
@@ -490,6 +529,9 @@ int main(void) {
         make_cts(packet, config.network_id, 9, 1, 40,
             TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, 64);
         deliver(&core, packet);
+        assert(!core.tx.active);
+        fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
         assert(core.tx.kind == TRANSPORT_TX_PIPE);
         assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 26);
         ack_tx(&core);

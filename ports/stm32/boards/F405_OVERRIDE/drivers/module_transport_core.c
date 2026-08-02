@@ -201,7 +201,7 @@ STATIC mp_obj_t transport_core_make_new(const mp_obj_type_t *type,
         { MP_QSTR_command_lease_ms, MP_ARG_INT, {.u_int = 2000} },
         { MP_QSTR_pipe_lease_ms, MP_ARG_INT, {.u_int = 10000} },
         { MP_QSTR_max_rt_window_ms, MP_ARG_INT, {.u_int = 100} },
-        { MP_QSTR_max_rt_restarts, MP_ARG_INT, {.u_int = 3} },
+        { MP_QSTR_max_rt_restarts, MP_ARG_INT, {.u_int = -1} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args,
@@ -229,8 +229,9 @@ STATIC mp_obj_t transport_core_make_new(const mp_obj_type_t *type,
             || args[ARG_pipe_lease_ms].u_int > 0xffff
             || args[ARG_max_rt_window_ms].u_int < 0
             || args[ARG_max_rt_window_ms].u_int > 0xffff
-            || args[ARG_max_rt_restarts].u_int < 0
-            || args[ARG_max_rt_restarts].u_int > 0xff) {
+            || args[ARG_max_rt_restarts].u_int < -1
+            || args[ARG_max_rt_restarts].u_int >=
+                TRANSPORT_CORE_RESTARTS_UNBOUNDED) {
         mp_raise_ValueError(MP_ERROR_TEXT("invalid core configuration"));
     }
 
@@ -280,7 +281,9 @@ STATIC mp_obj_t transport_core_make_new(const mp_obj_type_t *type,
     config.command_lease_ms = (uint16_t)args[ARG_command_lease_ms].u_int;
     config.pipe_lease_ms = (uint16_t)args[ARG_pipe_lease_ms].u_int;
     config.max_rt_window_ms = (uint16_t)args[ARG_max_rt_window_ms].u_int;
-    config.max_rt_restarts = (uint8_t)args[ARG_max_rt_restarts].u_int;
+    config.max_rt_restarts = args[ARG_max_rt_restarts].u_int < 0 ?
+        TRANSPORT_CORE_RESTARTS_UNBOUNDED :
+        (uint8_t)args[ARG_max_rt_restarts].u_int;
     mp_transport_core_obj_t *self =
         mp_obj_malloc_with_finaliser(mp_transport_core_obj_t, type);
     memset(&self->core, 0, sizeof(self->core));

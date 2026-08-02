@@ -24,6 +24,9 @@
 #ifndef TRANSPORT_CORE_CONTROL_TX_SLOTS
 #define TRANSPORT_CORE_CONTROL_TX_SLOTS 4u
 #endif
+#ifndef TRANSPORT_CORE_CTS_TURNAROUND_MS
+#define TRANSPORT_CORE_CTS_TURNAROUND_MS 2u
+#endif
 #if TRANSPORT_CORE_COMMAND_SLOTS == 0 || TRANSPORT_CORE_COMMAND_SLOTS > 255
 #error "TRANSPORT_CORE_COMMAND_SLOTS must be in 1..255"
 #endif
@@ -37,6 +40,7 @@
 #error "TRANSPORT_CORE_CONTROL_TX_SLOTS must be in 1..127"
 #endif
 #define TRANSPORT_CORE_INVALID_ID 0xffu
+#define TRANSPORT_CORE_RESTARTS_UNBOUNDED 0xffu
 
 /* The wire header remains five bytes.  NRF payloads are fixed at 32 bytes;
    unused bytes after the logical CRC are zero-filled. */
@@ -250,6 +254,7 @@ typedef struct {
     volatile uint8_t event_read, event_write;
     bool started;
     uint32_t sticky_errors;
+    uint32_t application_tx_not_before_ms;
     transport_retry_record_t retry;
     transport_tx_record_t tx;
     transport_registration_tx_t registration_tx;

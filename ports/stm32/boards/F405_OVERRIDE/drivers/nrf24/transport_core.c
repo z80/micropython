@@ -123,6 +123,7 @@ static void core_tx_kick(transport_core_t *core) {
     uint8_t slot;
     size_t payload_length = 0;
     bool last_packet = false;
+    bool application_tx_ready;
     transport_tx_kind_t kind = TRANSPORT_TX_NONE;
     transport_critical_state_t critical;
     nrf24_t *radio;
@@ -149,7 +150,9 @@ static void core_tx_kick(transport_core_t *core) {
         payload_length = packet[4] & TRANSPORT_WIRE_LENGTH_MASK;
         last_packet = true;
     }
-    for (slot = 0; kind == TRANSPORT_TX_NONE &&
+    application_tx_ready = core_deadline_reached(core_now_ms(core),
+        core->application_tx_not_before_ms);
+    for (slot = 0; kind == TRANSPORT_TX_NONE && application_tx_ready &&
             slot < TRANSPORT_CORE_COMMAND_SLOTS; ++slot) {
         transport_command_slot_t *command = &core->commands[slot];
         if (command->direction == TRANSPORT_DIRECTION_TX &&
@@ -183,7 +186,7 @@ static void core_tx_kick(transport_core_t *core) {
             break;
         }
     }
-    if (kind == TRANSPORT_TX_NONE) {
+    if (kind == TRANSPORT_TX_NONE && application_tx_ready) {
         for (slot = 0; slot < TRANSPORT_CORE_PIPE_SLOTS; ++slot) {
             transport_pipe_slot_t *pipe = &core->pipes[slot];
             if (pipe->direction == TRANSPORT_DIRECTION_TX &&
@@ -1103,6 +1106,8 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
             pipe->granted_bytes = value;
             pipe->transferred_bytes = 0;
             pipe->state = TRANSPORT_PIPE_TX_OPEN;
+            core->application_tx_not_before_ms = core_now_ms(core) +
+                TRANSPORT_CORE_CTS_TURNAROUND_MS;
             pipe->lease_deadline_ms = core->config.pipe_lease_ms != 0 ?
                 core_now_ms(core) + core->config.pipe_lease_ms : 0;
             memset(&event, 0, sizeof(event));
@@ -1126,6 +1131,8 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
         if (delta != 0 && delta < 0x80000000u &&
                 delta <= pipe->buffer.capacity) {
             pipe->granted_bytes = value;
+            core->application_tx_not_before_ms = core_now_ms(core) +
+                TRANSPORT_CORE_CTS_TURNAROUND_MS;
             if (core->config.pipe_lease_ms != 0) {
                 pipe->lease_deadline_ms = core_now_ms(core) +
                     core->config.pipe_lease_ms;
@@ -1143,6 +1150,8 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
     if (result == TRANSPORT_CTS_ACCEPTED &&
             value == core->commands[slot].target_length) {
         core->commands[slot].state = TRANSPORT_COMMAND_TX_SENDING;
+        core->application_tx_not_before_ms = core_now_ms(core) +
+            TRANSPORT_CORE_CTS_TURNAROUND_MS;
         core->commands[slot].lease_deadline_ms = core_now_ms(core) +
             core->config.command_lease_ms;
         return;
@@ -1538,7 +1547,9 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                 core->retry.state = TRANSPORT_RETRY_MAX_RT;
                 core->retry.deadline_ms = now + core->config.max_rt_window_ms;
             }
-            if (core->retry.restarts < core->retry.max_restarts &&
+            if ((core->retry.max_restarts ==
+                    TRANSPORT_CORE_RESTARTS_UNBOUNDED ||
+                 core->retry.restarts < core->retry.max_restarts) &&
                     !core_deadline_reached(now, core->retry.deadline_ms)) {
                 core->retry.restarts++;
                 core->stats.max_rt_restarts++;
