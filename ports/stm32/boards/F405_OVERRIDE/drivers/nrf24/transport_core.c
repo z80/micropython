@@ -486,6 +486,10 @@ static void core_maybe_queue_rx_credit(transport_core_t *core,
             pipe->credit_update_pending) {
         return;
     }
+    /* Do not turn the half-duplex receiver around while the peer can still
+       be transmitting against its current credit.  Replenish only after the
+       granted window is exhausted and the sender has necessarily stopped. */
+    if (pipe->transferred_bytes != pipe->granted_bytes) return;
     desired = pipe->transferred_bytes +
         (uint32_t)transport_ring_writable(&pipe->buffer);
     if (desired == pipe->granted_bytes) return;
@@ -1099,8 +1103,7 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
             pipe->granted_bytes = value;
             pipe->transferred_bytes = 0;
             pipe->state = TRANSPORT_PIPE_TX_OPEN;
-            pipe->lease_deadline_ms =
-                transport_ring_readable(&pipe->buffer) != 0 ?
+            pipe->lease_deadline_ms = core->config.pipe_lease_ms != 0 ?
                 core_now_ms(core) + core->config.pipe_lease_ms : 0;
             memset(&event, 0, sizeof(event));
             event.type = TRANSPORT_EVENT_PIPE_OPENED;
@@ -1123,8 +1126,7 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
         if (delta != 0 && delta < 0x80000000u &&
                 delta <= pipe->buffer.capacity) {
             pipe->granted_bytes = value;
-            if (transport_ring_readable(&pipe->buffer) != 0 ||
-                    pipe->state == TRANSPORT_PIPE_TX_CLOSING) {
+            if (core->config.pipe_lease_ms != 0) {
                 pipe->lease_deadline_ms = core_now_ms(core) +
                     core->config.pipe_lease_ms;
             }
@@ -1508,8 +1510,7 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                     if (core->tx.last_packet) {
                         core_finish_outbound_pipe(core, slot, true, 0);
                     } else {
-                        if (transport_ring_readable(&pipe->buffer) != 0 ||
-                                pipe->state == TRANSPORT_PIPE_TX_CLOSING) {
+                        if (core->config.pipe_lease_ms != 0) {
                             pipe->lease_deadline_ms = core_now_ms(core) +
                                 core->config.pipe_lease_ms;
                         } else {
@@ -1660,8 +1661,7 @@ void transport_core_service(transport_core_t *core) {
                 pipe->direction == TRANSPORT_DIRECTION_TX &&
                 (pipe->state == TRANSPORT_PIPE_TX_WAIT_CTS ||
                  pipe->state == TRANSPORT_PIPE_TX_CLOSING ||
-                 (pipe->state == TRANSPORT_PIPE_TX_OPEN &&
-                  transport_ring_readable(&pipe->buffer) != 0)) &&
+                 pipe->state == TRANSPORT_PIPE_TX_OPEN) &&
                 core_deadline_reached(now, pipe->lease_deadline_ms)) {
             if (core->tx.active && core->tx.kind == TRANSPORT_TX_PIPE &&
                     core->tx.slot == i) {

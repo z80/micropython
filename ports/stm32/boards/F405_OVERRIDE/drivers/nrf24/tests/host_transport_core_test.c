@@ -532,7 +532,9 @@ int main(void) {
             TRANSPORT_PIPE_FAILURE_CTS_BASE + TRANSPORT_CTS_BUSY);
     }
 
-    /* Reading a live RX stream returns capacity as a cumulative credit CTS. */
+    /* Reading a live RX stream replenishes cumulative credit only after the
+       current grant is exhausted, avoiding a half-duplex turnaround while
+       the sender can still be transmitting. */
     make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1, 43,
         TRANSPORT_WIRE_INTENT | TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
     deliver(&core, packet);
@@ -548,10 +550,18 @@ int main(void) {
         &event_length, &required) == TRANSPORT_POLL_EVENT);
     assert(transport_event_get_type(event_buffer) ==
         TRANSPORT_EVENT_PIPE_RX_DATA);
+    assert(!core.tx.active);
+    make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1, 43,
+        0, outbound + 26, 6);
+    deliver(&core, packet);
+    assert(transport_core_poll_into(&core, event_buffer, sizeof(event_buffer),
+        &event_length, &required) == TRANSPORT_POLL_EVENT);
+    assert(transport_event_get_type(event_buffer) ==
+        TRANSPORT_EVENT_PIPE_RX_DATA);
     assert(core.tx.kind == TRANSPORT_TX_CONTROL);
     assert(captured_tx[5] == TRANSPORT_WIRE_STREAM);
     assert(captured_tx[6] == TRANSPORT_CTS_ACCEPTED);
-    assert(captured_tx[7] == 58 && captured_tx[8] == 0);
+    assert(captured_tx[7] == 64 && captured_tx[8] == 0);
     ack_tx(&core);
     make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1, 43,
         TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
@@ -576,9 +586,35 @@ int main(void) {
             TRANSPORT_PIPE_FAILURE_TIMEOUT);
     }
 
-    assert(core.stats.pipes_opened == 3);
+    /* An accepted outbound stream must retain an idle lease.  Otherwise a
+       vanished application can leave the slot allocated forever. */
+    {
+        int pipe_id = transport_core_open_pipe(&core, 9, 45);
+        assert(pipe_id == 0);
+        ack_tx(&core);
+        make_cts(packet, config.network_id, 9, 1, 45,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, 32);
+        deliver(&core, packet);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_OPENED);
+        fake_now += config.pipe_lease_ms;
+        transport_core_service(&core);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(transport_event_get_value0(event_buffer) ==
+            TRANSPORT_PIPE_FAILURE_TIMEOUT);
+        assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_FREE);
+    }
+
+    assert(core.stats.pipes_opened == 4);
     assert(core.stats.pipes_closed == 3);
-    assert(core.stats.pipes_failed == 2);
+    assert(core.stats.pipes_failed == 3);
 
     /* Registration datagrams use explicit RF addresses while preserving the
        logical source/destination fields used by Python registration policy. */

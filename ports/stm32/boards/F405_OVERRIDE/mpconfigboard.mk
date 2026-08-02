@@ -14,5 +14,5 @@ MICROPY_VFS_FAT  = 1
 #MICROPY_VFS_LFS2 = 1
 
 # User modules are described by drivers/micropython.mk.
-USER_C_MODULES = $(BOARD_DIR)
+USER_C_MODULES = $(BOARD_DIR)/drivers
 
