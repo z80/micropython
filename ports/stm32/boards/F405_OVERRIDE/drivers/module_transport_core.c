@@ -231,7 +231,7 @@ STATIC mp_obj_t transport_core_make_new(const mp_obj_type_t *type,
             || args[ARG_max_rt_window_ms].u_int > 0xffff
             || args[ARG_max_rt_restarts].u_int < -1
             || args[ARG_max_rt_restarts].u_int >=
-                TRANSPORT_CORE_RESTARTS_UNBOUNDED) {
+                (mp_int_t)TRANSPORT_CORE_RESTARTS_UNBOUNDED) {
         mp_raise_ValueError(MP_ERROR_TEXT("invalid core configuration"));
     }
 
