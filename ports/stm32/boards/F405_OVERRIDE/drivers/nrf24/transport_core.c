@@ -16,6 +16,7 @@ static void core_finish_outbound_command(transport_core_t *, uint8_t, bool,
 static void core_finish_outbound_pipe(transport_core_t *, uint8_t, bool,
     uint32_t);
 static void core_finish_registration_tx(transport_core_t *, bool, uint32_t);
+static bool queue_pipe_tx_space_event(transport_core_t *, uint8_t);
 
 static uint32_t core_now_ms(transport_core_t *core) {
     if (core->config.radio.ticks_ms == NULL) return 0;
@@ -113,23 +114,178 @@ static bool core_build_packet(transport_core_t *core, uint8_t message_type,
 static void core_restore_rx(transport_core_t *core) {
     transport_critical_state_t critical = core_enter(core);
     nrf24_enter_rx_mode(core->config.radio.radio);
+    core->radio_phase = TRANSPORT_RADIO_RX_IDLE;
+    core->tx_campaign_active = false;
     core_exit(core, critical);
+}
+
+static void core_release_tx_owner(transport_core_t *core) {
+    memset(&core->tx, 0, sizeof(core->tx));
+    core->tx.kind = TRANSPORT_TX_NONE;
+}
+
+static void core_enter_forced_rx(transport_core_t *core, uint32_t now) {
+    core_release_tx_owner(core);
+    nrf24_enter_rx_mode(core->config.radio.radio);
+    core->radio_phase = TRANSPORT_RADIO_RX_YIELD;
+    core->tx_campaign_active = false;
+    core->rx_yield_started_ms = now;
+    core->rx_yield_deadline_ms = now + core->forced_rx_ms;
+}
+
+static bool core_tx_time_expired(transport_core_t *core, uint32_t now) {
+    return core->tx_campaign_active && core->max_continuous_tx_ms != 0 &&
+        core_deadline_reached(now,
+            core->tx_campaign_started_ms + core->max_continuous_tx_ms);
+}
+
+static void core_commit_staged_tx(transport_core_t *core) {
+    if (core->tx.kind == TRANSPORT_TX_COMMAND &&
+            core->tx.slot < TRANSPORT_CORE_COMMAND_SLOTS) {
+        core->commands[core->tx.slot].transferred_length +=
+            (uint16_t)core->tx.staged_payload_bytes;
+    } else if (core->tx.kind == TRANSPORT_TX_PIPE &&
+            core->tx.slot < TRANSPORT_CORE_PIPE_SLOTS) {
+        core->pipes[core->tx.slot].transferred_bytes +=
+            core->tx.staged_payload_bytes;
+        core->stats.pipe_tx_bytes += core->tx.staged_payload_bytes;
+    }
+    core->stats.tx_packets += core->tx.staged_packets;
+    core->tx.staged_payload_bytes = 0;
+    core->tx.staged_packets = 0;
+}
+
+static void core_fail_active_tx(transport_core_t *core, uint32_t detail) {
+    transport_tx_kind_t kind = core->tx.kind;
+    uint8_t slot = core->tx.slot;
+    nrf24_abort_send(core->config.radio.radio);
+    if (kind == TRANSPORT_TX_COMMAND && slot < TRANSPORT_CORE_COMMAND_SLOTS) {
+        core_finish_outbound_command(core, slot, false,
+            TRANSPORT_COMMAND_FAILURE_RADIO);
+    } else if (kind == TRANSPORT_TX_PIPE &&
+            slot < TRANSPORT_CORE_PIPE_SLOTS) {
+        core_finish_outbound_pipe(core, slot, false,
+            TRANSPORT_PIPE_FAILURE_RADIO);
+    }
+    core_release_tx_owner(core);
+    core_restore_rx(core);
+    transport_core_report_error(core, TRANSPORT_ERROR_RADIO,
+        TRANSPORT_CORE_INVALID_ID, detail);
+}
+
+static bool core_application_waiting_cts(const transport_core_t *core) {
+    uint8_t slot;
+    for (slot = 0; slot < TRANSPORT_CORE_COMMAND_SLOTS; ++slot) {
+        if (core->commands[slot].direction == TRANSPORT_DIRECTION_TX &&
+                core->commands[slot].state ==
+                    TRANSPORT_COMMAND_TX_WAIT_CTS) return true;
+    }
+    for (slot = 0; slot < TRANSPORT_CORE_PIPE_SLOTS; ++slot) {
+        if (core->pipes[slot].direction == TRANSPORT_DIRECTION_TX &&
+                core->pipes[slot].state ==
+                    TRANSPORT_PIPE_TX_WAIT_CTS) return true;
+    }
+    return false;
+}
+
+/* Fill no more than one hardware FIFO depth per invocation.  CE may already
+   be high, so an unbounded "until full" loop could otherwise race the radio. */
+static bool core_fill_tx_owner(transport_core_t *core) {
+    uint8_t writes;
+    nrf24_t *radio = core->config.radio.radio;
+    for (writes = 0; writes < 3 && !core->tx.drain_requested &&
+            !core->tx.last_packet && !nrf24_tx_fifo_full(radio); ++writes) {
+        uint8_t packet[NRF24_MAX_PAYLOAD];
+        uint8_t fragment[TRANSPORT_WIRE_MAX_DATA];
+        size_t payload_length = 0;
+        bool last_packet = false;
+
+        if (core->tx.kind == TRANSPORT_TX_COMMAND &&
+                core->tx.slot < TRANSPORT_CORE_COMMAND_SLOTS) {
+            transport_command_slot_t *command =
+                &core->commands[core->tx.slot];
+            size_t remaining = transport_ring_readable(&command->buffer);
+            payload_length = remaining > TRANSPORT_WIRE_MAX_DATA ?
+                TRANSPORT_WIRE_MAX_DATA : remaining;
+            if (payload_length != 0 && transport_ring_peek(&command->buffer,
+                    fragment, payload_length) != payload_length) return false;
+            last_packet = remaining <= TRANSPORT_WIRE_MAX_DATA;
+            if (!core_build_packet(core, command->message_type,
+                    command->peer_id, (uint8_t)command->transaction_id,
+                    last_packet ? TRANSPORT_WIRE_LAST_PACKET : 0,
+                    fragment, payload_length, packet)) return false;
+            if (!nrf24_write_payload(radio, packet, sizeof(packet))) return false;
+            (void)transport_ring_discard(&command->buffer, payload_length);
+        } else if (core->tx.kind == TRANSPORT_TX_PIPE &&
+                core->tx.slot < TRANSPORT_CORE_PIPE_SLOTS) {
+            transport_pipe_slot_t *pipe = &core->pipes[core->tx.slot];
+            size_t remaining = transport_ring_readable(&pipe->buffer);
+            uint32_t used_credit = pipe->transferred_bytes +
+                core->tx.staged_payload_bytes;
+            uint32_t credit = pipe->granted_bytes > used_credit ?
+                pipe->granted_bytes - used_credit : 0;
+            if (remaining != 0 && credit != 0) {
+                payload_length = remaining > TRANSPORT_WIRE_MAX_DATA ?
+                    TRANSPORT_WIRE_MAX_DATA : remaining;
+                if (payload_length > credit) payload_length = (size_t)credit;
+                if (transport_ring_peek(&pipe->buffer, fragment,
+                        payload_length) != payload_length ||
+                        !core_build_packet(core, TRANSPORT_WIRE_STREAM,
+                            pipe->peer_id, (uint8_t)pipe->session_id, 0,
+                            fragment, payload_length, packet)) return false;
+                if (!nrf24_write_payload(radio, packet, sizeof(packet))) return false;
+                (void)transport_ring_discard(&pipe->buffer, payload_length);
+                (void)queue_pipe_tx_space_event(core, core->tx.slot);
+            } else if (pipe->state == TRANSPORT_PIPE_TX_CLOSING &&
+                    remaining == 0) {
+                if (!core_build_packet(core, TRANSPORT_WIRE_STREAM,
+                        pipe->peer_id, (uint8_t)pipe->session_id,
+                        TRANSPORT_WIRE_LAST_PACKET, NULL, 0, packet) ||
+                        !nrf24_write_payload(radio, packet, sizeof(packet))) {
+                    return false;
+                }
+                last_packet = true;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+        core->tx.payload_length = (uint8_t)payload_length;
+        core->tx.staged_payload_bytes += (uint32_t)payload_length;
+        core->tx.staged_packets++;
+        core->tx.last_packet = last_packet;
+    }
+    return core_radio_io_ok(core);
 }
 
 static void core_tx_kick(transport_core_t *core) {
     uint8_t packet[NRF24_MAX_PAYLOAD];
-    uint8_t fragment[TRANSPORT_WIRE_MAX_DATA];
     uint8_t address[NRF24_ADDR_LEN];
     uint8_t slot;
-    size_t payload_length = 0;
-    bool last_packet = false;
     bool application_tx_ready;
     transport_tx_kind_t kind = TRANSPORT_TX_NONE;
     transport_critical_state_t critical;
     nrf24_t *radio;
     if (core == NULL) return;
     critical = core_enter(core);
-    if (!core->started || core->tx.active) {
+    if (!core->started || core->radio_phase == TRANSPORT_RADIO_RX_YIELD) {
+        core_exit(core, critical);
+        return;
+    }
+    if (core->tx.active) {
+        bool expired = core_tx_time_expired(core, core_now_ms(core));
+        if (!expired && !core->tx.drain_requested) {
+            if (!core_fill_tx_owner(core)) {
+                core_fail_active_tx(core, 0x46494cu);
+            }
+            core_exit(core, critical);
+            return;
+        }
+        if (expired) {
+            core->tx.drain_requested = true;
+            core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+        }
         core_exit(core, critical);
         return;
     }
@@ -139,49 +295,21 @@ static void core_tx_kick(transport_core_t *core) {
                 sizeof(packet)) == sizeof(packet)) {
         kind = TRANSPORT_TX_CONTROL;
         slot = TRANSPORT_CORE_INVALID_ID;
-        payload_length = 0;
-        last_packet = true;
     }
     if (kind == TRANSPORT_TX_NONE && core->registration_tx.pending) {
         memcpy(packet, core->registration_tx.packet, sizeof(packet));
         memcpy(address, core->registration_tx.address, sizeof(address));
         kind = TRANSPORT_TX_REGISTRATION;
         slot = TRANSPORT_CORE_INVALID_ID;
-        payload_length = packet[4] & TRANSPORT_WIRE_LENGTH_MASK;
-        last_packet = true;
     }
     application_tx_ready = core_deadline_reached(core_now_ms(core),
-        core->application_tx_not_before_ms);
+        core->application_tx_not_before_ms) &&
+        !core_application_waiting_cts(core);
     for (slot = 0; kind == TRANSPORT_TX_NONE && application_tx_ready &&
             slot < TRANSPORT_CORE_COMMAND_SLOTS; ++slot) {
         transport_command_slot_t *command = &core->commands[slot];
-        if (command->direction == TRANSPORT_DIRECTION_TX &&
+            if (command->direction == TRANSPORT_DIRECTION_TX &&
                 command->state == TRANSPORT_COMMAND_TX_SENDING) {
-            size_t remaining = transport_ring_readable(&command->buffer);
-            payload_length = remaining;
-            if (payload_length > TRANSPORT_WIRE_MAX_DATA) {
-                payload_length = TRANSPORT_WIRE_MAX_DATA;
-            }
-            if (payload_length != 0 &&
-                    transport_ring_peek(&command->buffer,
-                        fragment,
-                        payload_length) != payload_length) {
-                core_finish_outbound_command(core, slot, false,
-                    TRANSPORT_COMMAND_FAILURE_RADIO);
-                core_exit(core, critical);
-                return;
-            }
-            last_packet = remaining <= TRANSPORT_WIRE_MAX_DATA;
-            if (!core_build_packet(core, command->message_type,
-                    command->peer_id, (uint8_t)command->transaction_id,
-                    last_packet ? TRANSPORT_WIRE_LAST_PACKET : 0,
-                    fragment, payload_length,
-                    packet)) {
-                core_finish_outbound_command(core, slot, false,
-                    TRANSPORT_COMMAND_FAILURE_RADIO);
-                core_exit(core, critical);
-                return;
-            }
             kind = TRANSPORT_TX_COMMAND;
             break;
         }
@@ -193,44 +321,15 @@ static void core_tx_kick(transport_core_t *core) {
                     (pipe->state == TRANSPORT_PIPE_TX_OPEN ||
                      pipe->state == TRANSPORT_PIPE_TX_CLOSING)) {
                 size_t remaining = transport_ring_readable(&pipe->buffer);
-                uint32_t credit = pipe->granted_bytes -
-                    pipe->transferred_bytes;
-                if (credit > pipe->buffer.capacity) {
-                    credit = (uint32_t)pipe->buffer.capacity;
-                }
+                uint32_t credit = pipe->granted_bytes > pipe->transferred_bytes ?
+                    pipe->granted_bytes - pipe->transferred_bytes : 0;
                 if (remaining != 0 && credit != 0) {
-                    payload_length = remaining;
-                    if (payload_length > TRANSPORT_WIRE_MAX_DATA) {
-                        payload_length = TRANSPORT_WIRE_MAX_DATA;
-                    }
-                    if (payload_length > credit) payload_length = credit;
-                    if (transport_ring_peek(&pipe->buffer, fragment,
-                            payload_length) != payload_length ||
-                            !core_build_packet(core, TRANSPORT_WIRE_STREAM,
-                                pipe->peer_id, (uint8_t)pipe->session_id, 0,
-                                fragment, payload_length, packet)) {
-                        core_finish_outbound_pipe(core, slot, false,
-                            TRANSPORT_PIPE_FAILURE_RADIO);
-                        core_exit(core, critical);
-                        return;
-                    }
                     kind = TRANSPORT_TX_PIPE;
-                    last_packet = false;
                     break;
                 }
                 if (pipe->state == TRANSPORT_PIPE_TX_CLOSING &&
                         remaining == 0) {
-                    if (!core_build_packet(core, TRANSPORT_WIRE_STREAM,
-                            pipe->peer_id, (uint8_t)pipe->session_id,
-                            TRANSPORT_WIRE_LAST_PACKET, NULL, 0, packet)) {
-                        core_finish_outbound_pipe(core, slot, false,
-                            TRANSPORT_PIPE_FAILURE_RADIO);
-                        core_exit(core, critical);
-                        return;
-                    }
                     kind = TRANSPORT_TX_PIPE;
-                    payload_length = 0;
-                    last_packet = true;
                     break;
                 }
             }
@@ -256,7 +355,13 @@ static void core_tx_kick(transport_core_t *core) {
         core_exit(core, critical);
         return;
     }
-    core->tx.destination_id = packet[2];
+    if (kind == TRANSPORT_TX_COMMAND) {
+        core->tx.destination_id = core->commands[slot].peer_id;
+    } else if (kind == TRANSPORT_TX_PIPE) {
+        core->tx.destination_id = core->pipes[slot].peer_id;
+    } else {
+        core->tx.destination_id = packet[2];
+    }
     if (kind != TRANSPORT_TX_REGISTRATION) {
         address[0] = core->tx.destination_id;
         memcpy(address + 1, core->config.network_id,
@@ -265,9 +370,20 @@ static void core_tx_kick(transport_core_t *core) {
     radio = core->config.radio.radio;
     nrf24_enter_tx_mode(radio);
     nrf24_open_tx_pipe(radio, address);
-    if (!core_radio_io_ok(core) ||
-            !nrf24_write_payload(radio, packet, sizeof(packet)) ||
-            !core_radio_io_ok(core)) {
+    core->tx.active = true;
+    core->tx.kind = kind;
+    core->tx.slot = slot;
+    if (!core->tx_campaign_active) {
+        core->tx_campaign_active = true;
+        core->tx_campaign_started_ms = core_now_ms(core);
+    }
+    core->radio_phase = TRANSPORT_RADIO_TX_ACTIVE;
+    if (kind == TRANSPORT_TX_CONTROL || kind == TRANSPORT_TX_REGISTRATION) {
+        if (!nrf24_write_payload(radio, packet, sizeof(packet))) goto tx_failed;
+        core->tx.last_packet = true;
+        core->tx.staged_packets = 1;
+    } else if (!core_fill_tx_owner(core)) {
+tx_failed:
         nrf24_abort_send(radio);
         if (kind == TRANSPORT_TX_CONTROL) {
             core_control_failed(core, packet);
@@ -283,17 +399,13 @@ static void core_tx_kick(transport_core_t *core) {
             core_finish_outbound_pipe(core, slot, false,
                 TRANSPORT_PIPE_FAILURE_RADIO);
         }
+        core_release_tx_owner(core);
         core_restore_rx(core);
         transport_core_report_error(core, TRANSPORT_ERROR_RADIO,
             TRANSPORT_CORE_INVALID_ID, 0x545851u);
         core_exit(core, critical);
         return;
     }
-    core->tx.active = true;
-    core->tx.kind = kind;
-    core->tx.slot = slot;
-    core->tx.payload_length = (uint8_t)payload_length;
-    core->tx.last_packet = last_packet;
     memset(&core->retry, 0, sizeof(core->retry));
     core->retry.max_restarts = core->config.max_rt_restarts;
     nrf24_set_ce(radio, true);
@@ -317,6 +429,10 @@ static bool core_queue_packet(transport_core_t *core,
                 sizeof(packet)) {
         core->stats.control_packets_queued++;
         queued = true;
+        if (core->tx.active && core->tx.kind != TRANSPORT_TX_CONTROL) {
+            core->tx.drain_requested = true;
+            core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+        }
     } else {
         core->sticky_errors |=
             (uint32_t)1u << TRANSPORT_ERROR_CONTROL_QUEUE_FULL;
@@ -486,7 +602,7 @@ static void core_maybe_queue_rx_credit(transport_core_t *core,
     uint32_t desired;
     if (pipe->direction != TRANSPORT_DIRECTION_RX ||
             pipe->state != TRANSPORT_PIPE_OPEN ||
-            pipe->credit_update_pending) {
+            pipe->credit_update_pending || pipe->rx_event_pending) {
         return;
     }
     /* Do not turn the half-duplex receiver around while the peer can still
@@ -574,13 +690,32 @@ static void core_finish_outbound_command(transport_core_t *core, uint8_t slot,
     (void)transport_core_emit(core, &event);
 }
 
-static bool core_outbound_application_busy(const transport_core_t *core) {
+static bool core_outbound_command_busy(const transport_core_t *core) {
     uint8_t slot;
     for (slot = 0; slot < TRANSPORT_CORE_COMMAND_SLOTS; ++slot) {
         if (core->commands[slot].direction == TRANSPORT_DIRECTION_TX) {
             return true;
         }
     }
+    return false;
+}
+
+static bool core_outbound_pipe_handshake_busy(const transport_core_t *core) {
+    uint8_t slot;
+    for (slot = 0; slot < TRANSPORT_CORE_PIPE_SLOTS; ++slot) {
+        const transport_pipe_slot_t *pipe = &core->pipes[slot];
+        if (pipe->direction == TRANSPORT_DIRECTION_TX &&
+                (pipe->state == TRANSPORT_PIPE_TX_INTENT_QUEUED ||
+                 pipe->state == TRANSPORT_PIPE_TX_WAIT_CTS)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool core_outbound_application_busy(const transport_core_t *core) {
+    uint8_t slot;
+    if (core_outbound_command_busy(core)) return true;
     for (slot = 0; slot < TRANSPORT_CORE_PIPE_SLOTS; ++slot) {
         if (core->pipes[slot].direction == TRANSPORT_DIRECTION_TX) return true;
     }
@@ -653,7 +788,8 @@ bool transport_core_send_command(transport_core_t *core,
         return false;
     }
     critical = core_enter(core);
-    if (core_outbound_application_busy(core)) {
+    if (core_outbound_command_busy(core) ||
+            core_outbound_pipe_handshake_busy(core)) {
         core_exit(core, critical);
         return false;
     }
@@ -713,6 +849,11 @@ bool transport_core_send_registration(transport_core_t *core,
     memcpy(core->registration_tx.address, address, NRF24_ADDR_LEN);
     memcpy(core->registration_tx.packet, packet, sizeof(packet));
     core->registration_tx.pending = true;
+    if (core->tx.active && (core->tx.kind == TRANSPORT_TX_COMMAND ||
+            core->tx.kind == TRANSPORT_TX_PIPE)) {
+        core->tx.drain_requested = true;
+        core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+    }
     core_exit(core, critical);
     core_tx_kick(core);
     return true;
@@ -1287,6 +1428,10 @@ void transport_core_init(transport_core_t *core,
     else core->config.node_id = TRANSPORT_CORE_INVALID_ID;
     if (core->config.preferred_pipe_event_bytes == 0)
         core->config.preferred_pipe_event_bytes = 512;
+    core->max_continuous_tx_ms =
+        TRANSPORT_CORE_DEFAULT_MAX_CONTINUOUS_TX_MS;
+    core->forced_rx_ms = TRANSPORT_CORE_DEFAULT_FORCED_RX_MS;
+    core->radio_phase = TRANSPORT_RADIO_RX_IDLE;
     if (core->config.node_id == 0 && !core->config.has_service_address) {
         core->config.service_address[0] = TRANSPORT_CORE_INVALID_ID;
         memcpy(core->config.service_address + 1, core->config.network_id,
@@ -1416,6 +1561,11 @@ void transport_core_stop(transport_core_t *core) {
     memset(&core->retry, 0, sizeof(core->retry));
     memset(&core->tx, 0, sizeof(core->tx));
     memset(&core->registration_tx, 0, sizeof(core->registration_tx));
+    core->radio_phase = TRANSPORT_RADIO_RX_IDLE;
+    core->rx_yield_started_ms = 0;
+    core->rx_yield_deadline_ms = 0;
+    core->tx_campaign_active = false;
+    core->tx_campaign_started_ms = 0;
     core->retry.max_restarts = core->config.max_rt_restarts;
     for (i = 0; i < TRANSPORT_CORE_COMMAND_SLOTS; ++i) {
         transport_ring_reset(&core->commands[i].buffer);
@@ -1477,72 +1627,17 @@ void transport_core_on_radio_irq(transport_core_t *core) {
             handled = true;
         }
 
-        if ((status & NRF24_STATUS_TX_DS) != 0) {
-            nrf24_set_ce(radio, false);
-            nrf24_clear_irq(radio, NRF24_STATUS_TX_DS);
-            core->stats.tx_packets++;
-            if (core->tx.active) {
-                if (core->tx.kind == TRANSPORT_TX_CONTROL) {
-                    uint8_t packet[NRF24_MAX_PAYLOAD];
-                    if (transport_ring_peek(&core->control_tx, packet,
-                            sizeof(packet)) == sizeof(packet)) {
-                        core_control_acked(core, packet);
-                    }
-                    (void)transport_ring_discard(&core->control_tx,
-                        TRANSPORT_CONTROL_RECORD_SIZE);
-                    core->stats.control_packets_acked++;
-                } else if (core->tx.kind == TRANSPORT_TX_REGISTRATION) {
-                    core_finish_registration_tx(core, true, 0);
-                } else if (core->tx.kind == TRANSPORT_TX_COMMAND &&
-                        core->tx.slot < TRANSPORT_CORE_COMMAND_SLOTS) {
-                    uint8_t slot = core->tx.slot;
-                    transport_command_slot_t *command = &core->commands[slot];
-                    uint16_t total_length = command->target_length;
-                    (void)transport_ring_discard(&command->buffer,
-                        core->tx.payload_length);
-                    command->transferred_length += core->tx.payload_length;
-                    if (core->tx.last_packet) {
-                        core_finish_outbound_command(core, slot, true,
-                            total_length);
-                    } else {
-                        command->lease_deadline_ms = core_now_ms(core) +
-                            core->config.command_lease_ms;
-                    }
-                } else if (core->tx.kind == TRANSPORT_TX_PIPE &&
-                        core->tx.slot < TRANSPORT_CORE_PIPE_SLOTS) {
-                    uint8_t slot = core->tx.slot;
-                    transport_pipe_slot_t *pipe = &core->pipes[slot];
-                    (void)transport_ring_discard(&pipe->buffer,
-                        core->tx.payload_length);
-                    pipe->transferred_bytes += core->tx.payload_length;
-                    core->stats.pipe_tx_bytes += core->tx.payload_length;
-                    if (core->tx.last_packet) {
-                        core_finish_outbound_pipe(core, slot, true, 0);
-                    } else {
-                        if (core->config.pipe_lease_ms != 0) {
-                            pipe->lease_deadline_ms = core_now_ms(core) +
-                                core->config.pipe_lease_ms;
-                        } else {
-                            pipe->lease_deadline_ms = 0;
-                        }
-                        (void)queue_pipe_tx_space_event(core, slot);
-                    }
-                }
-                core->tx.active = false;
-                core->tx.kind = TRANSPORT_TX_NONE;
-            }
-            memset(&core->retry, 0, sizeof(core->retry));
-            core->retry.max_restarts = core->config.max_rt_restarts;
-            core_tx_kick(core);
-            if (!core->tx.active) {
-                core_restore_rx(core);
-            }
-            handled = true;
-        }
-
+        /* MAX_RT refers to the current FIFO head.  TX_DS may describe one or
+           more earlier entries, so MAX_RT must win when both bits are latched. */
         if ((status & NRF24_STATUS_MAX_RT) != 0) {
             uint32_t now = core_now_ms(core);
             core->stats.max_rt_events++;
+            if ((status & NRF24_STATUS_TX_DS) != 0) {
+                /* A previous FIFO head succeeded before the next head reached
+                   MAX_RT.  Retry accounting belongs to that new head. */
+                memset(&core->retry, 0, sizeof(core->retry));
+                core->retry.max_restarts = core->config.max_rt_restarts;
+            }
             if (core->retry.state == TRANSPORT_RETRY_IDLE) {
                 core->retry.state = TRANSPORT_RETRY_MAX_RT;
                 core->retry.deadline_ms = now + core->config.max_rt_window_ms;
@@ -1555,7 +1650,8 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                 core->stats.max_rt_restarts++;
                 core->retry.state = TRANSPORT_RETRY_HW_ACTIVE;
                 nrf24_set_ce(radio, false);
-                nrf24_clear_irq(radio, NRF24_STATUS_MAX_RT);
+                nrf24_clear_irq(radio,
+                    NRF24_STATUS_MAX_RT | NRF24_STATUS_TX_DS);
                 nrf24_set_ce(radio, true);
             } else {
                 core->retry.state = TRANSPORT_RETRY_EXHAUSTED;
@@ -1582,13 +1678,96 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                         core_finish_outbound_pipe(core, core->tx.slot, false,
                             TRANSPORT_PIPE_FAILURE_RADIO);
                     }
-                    core->tx.active = false;
-                    core->tx.kind = TRANSPORT_TX_NONE;
+                    core_release_tx_owner(core);
                 }
                 transport_core_report_error(core, TRANSPORT_ERROR_RADIO,
                     TRANSPORT_CORE_INVALID_ID, NRF24_STATUS_MAX_RT);
                 core_tx_kick(core);
                 if (!core->tx.active) core_restore_rx(core);
+            }
+            handled = true;
+        } else if ((status & NRF24_STATUS_TX_DS) != 0) {
+            uint32_t now = core_now_ms(core);
+            nrf24_clear_irq(radio, NRF24_STATUS_TX_DS);
+            memset(&core->retry, 0, sizeof(core->retry));
+            core->retry.max_restarts = core->config.max_rt_restarts;
+            if (core->tx.active) {
+                if (core_tx_time_expired(core, now)) {
+                    core->tx.drain_requested = true;
+                    core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+                }
+                if (nrf24_tx_fifo_empty(radio)) {
+                    transport_tx_kind_t kind = core->tx.kind;
+                    uint8_t slot = core->tx.slot;
+                    bool last_packet = core->tx.last_packet;
+                    bool forced_rx = core_tx_time_expired(core, now);
+                    bool priority_drain = core->tx.drain_requested && !forced_rx;
+                    nrf24_set_ce(radio, false);
+                    core_commit_staged_tx(core);
+                    if (kind == TRANSPORT_TX_CONTROL) {
+                        uint8_t sent_packet[NRF24_MAX_PAYLOAD];
+                        if (transport_ring_peek(&core->control_tx,
+                                sent_packet, sizeof(sent_packet)) ==
+                                sizeof(sent_packet)) {
+                            core_control_acked(core, sent_packet);
+                        }
+                        (void)transport_ring_discard(&core->control_tx,
+                            TRANSPORT_CONTROL_RECORD_SIZE);
+                        core->stats.control_packets_acked++;
+                    } else if (kind == TRANSPORT_TX_REGISTRATION) {
+                        core_finish_registration_tx(core, true, 0);
+                    } else if (kind == TRANSPORT_TX_COMMAND &&
+                            slot < TRANSPORT_CORE_COMMAND_SLOTS) {
+                        transport_command_slot_t *command =
+                            &core->commands[slot];
+                        if (last_packet) {
+                            core_finish_outbound_command(core, slot, true,
+                                command->target_length);
+                        } else if (core->config.command_lease_ms != 0) {
+                            command->lease_deadline_ms = now +
+                                core->config.command_lease_ms;
+                        }
+                    } else if (kind == TRANSPORT_TX_PIPE &&
+                            slot < TRANSPORT_CORE_PIPE_SLOTS) {
+                        transport_pipe_slot_t *pipe = &core->pipes[slot];
+                        if (last_packet) {
+                            core_finish_outbound_pipe(core, slot, true, 0);
+                        } else if (core->config.pipe_lease_ms != 0) {
+                            pipe->lease_deadline_ms = now +
+                                core->config.pipe_lease_ms;
+                        } else {
+                            pipe->lease_deadline_ms = 0;
+                        }
+                    }
+                    if (forced_rx && core->forced_rx_ms != 0) {
+                        core_enter_forced_rx(core, now);
+                    } else {
+                        if (forced_rx) core->tx_campaign_active = false;
+                        core_release_tx_owner(core);
+                        core->radio_phase = TRANSPORT_RADIO_RX_IDLE;
+                        core_tx_kick(core);
+                        if (!core->tx.active) core_restore_rx(core);
+                    }
+                    (void)priority_drain;
+                } else if (!core->tx.drain_requested) {
+                    if (!core_fill_tx_owner(core)) {
+                        nrf24_abort_send(radio);
+                        if (core->tx.kind == TRANSPORT_TX_COMMAND &&
+                                core->tx.slot < TRANSPORT_CORE_COMMAND_SLOTS) {
+                            core_finish_outbound_command(core, core->tx.slot,
+                                false, TRANSPORT_COMMAND_FAILURE_RADIO);
+                        } else if (core->tx.kind == TRANSPORT_TX_PIPE &&
+                                core->tx.slot < TRANSPORT_CORE_PIPE_SLOTS) {
+                            core_finish_outbound_pipe(core, core->tx.slot,
+                                false, TRANSPORT_PIPE_FAILURE_RADIO);
+                        }
+                        core_release_tx_owner(core);
+                        core_restore_rx(core);
+                        transport_core_report_error(core,
+                            TRANSPORT_ERROR_RADIO,
+                            TRANSPORT_CORE_INVALID_ID, 0x46494cu);
+                    }
+                }
             }
             handled = true;
         }
@@ -1616,8 +1795,19 @@ void transport_core_on_radio_irq(transport_core_t *core) {
 void transport_core_service(transport_core_t *core) {
     uint32_t now;
     uint8_t i;
+    transport_critical_state_t critical;
     if (core == NULL || !core->started) return;
     now = core_now_ms(core);
+    if (core->radio_phase == TRANSPORT_RADIO_RX_YIELD) {
+        if (!core_deadline_reached(now, core->rx_yield_deadline_ms)) return;
+        core->radio_phase = TRANSPORT_RADIO_RX_IDLE;
+    }
+    critical = core_enter(core);
+    if (core->tx.active && core_tx_time_expired(core, now)) {
+        core->tx.drain_requested = true;
+        core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+    }
+    core_exit(core, critical);
     for (i = 0; i < TRANSPORT_CORE_COMMAND_SLOTS; ++i) {
         transport_command_slot_t *command = &core->commands[i];
         if (core->config.command_lease_ms != 0 &&
@@ -1635,11 +1825,10 @@ void transport_core_service(transport_core_t *core) {
                 core_deadline_reached(now, command->lease_deadline_ms)) {
             if (core->tx.active && core->tx.kind == TRANSPORT_TX_COMMAND &&
                     core->tx.slot == i) {
-                transport_critical_state_t critical = core_enter(core);
+                transport_critical_state_t abort_critical = core_enter(core);
                 nrf24_abort_send(core->config.radio.radio);
-                core->tx.active = false;
-                core->tx.kind = TRANSPORT_TX_NONE;
-                core_exit(core, critical);
+                core_release_tx_owner(core);
+                core_exit(core, abort_critical);
             }
             core_finish_outbound_command(core, i, false,
                 TRANSPORT_COMMAND_FAILURE_TIMEOUT);
@@ -1676,11 +1865,10 @@ void transport_core_service(transport_core_t *core) {
                 core_deadline_reached(now, pipe->lease_deadline_ms)) {
             if (core->tx.active && core->tx.kind == TRANSPORT_TX_PIPE &&
                     core->tx.slot == i) {
-                transport_critical_state_t critical = core_enter(core);
+                transport_critical_state_t abort_critical = core_enter(core);
                 nrf24_abort_send(core->config.radio.radio);
-                core->tx.active = false;
-                core->tx.kind = TRANSPORT_TX_NONE;
-                core_exit(core, critical);
+                core_release_tx_owner(core);
+                core_exit(core, abort_critical);
             }
             core_finish_outbound_pipe(core, i, false,
                 TRANSPORT_PIPE_FAILURE_TIMEOUT);
@@ -1690,6 +1878,39 @@ void transport_core_service(transport_core_t *core) {
         }
     }
     core_tx_kick(core);
+}
+
+bool transport_core_set_radio_schedule(transport_core_t *core,
+        uint16_t max_continuous_tx_ms, uint16_t forced_rx_ms) {
+    transport_critical_state_t critical;
+    uint32_t now;
+    if (core == NULL) return false;
+    critical = core_enter(core);
+    core->max_continuous_tx_ms = max_continuous_tx_ms;
+    core->forced_rx_ms = forced_rx_ms;
+    now = core_now_ms(core);
+    if (core->radio_phase == TRANSPORT_RADIO_RX_YIELD) {
+        core->rx_yield_deadline_ms = core->rx_yield_started_ms + forced_rx_ms;
+    }
+    if (core->tx.active && core_tx_time_expired(core, now)) {
+        core->tx.drain_requested = true;
+        core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+    }
+    core_exit(core, critical);
+    return true;
+}
+
+void transport_core_get_radio_schedule(const transport_core_t *core,
+        uint16_t *max_continuous_tx_ms, uint16_t *forced_rx_ms) {
+    transport_critical_state_t critical;
+    uint16_t max_tx_snapshot, rx_snapshot;
+    if (core == NULL) return;
+    critical = core_enter((transport_core_t *)core);
+    max_tx_snapshot = core->max_continuous_tx_ms;
+    rx_snapshot = core->forced_rx_ms;
+    core_exit((transport_core_t *)core, critical);
+    if (max_continuous_tx_ms != NULL) *max_continuous_tx_ms = max_tx_snapshot;
+    if (forced_rx_ms != NULL) *forced_rx_ms = rx_snapshot;
 }
 
 bool transport_core_commit_command(transport_core_t *core, uint8_t slot,

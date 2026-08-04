@@ -27,6 +27,12 @@
 #ifndef TRANSPORT_CORE_CTS_TURNAROUND_MS
 #define TRANSPORT_CORE_CTS_TURNAROUND_MS 2u
 #endif
+#ifndef TRANSPORT_CORE_DEFAULT_MAX_CONTINUOUS_TX_MS
+#define TRANSPORT_CORE_DEFAULT_MAX_CONTINUOUS_TX_MS 20u
+#endif
+#ifndef TRANSPORT_CORE_DEFAULT_FORCED_RX_MS
+#define TRANSPORT_CORE_DEFAULT_FORCED_RX_MS 3u
+#endif
 #if TRANSPORT_CORE_COMMAND_SLOTS == 0 || TRANSPORT_CORE_COMMAND_SLOTS > 255
 #error "TRANSPORT_CORE_COMMAND_SLOTS must be in 1..255"
 #endif
@@ -205,10 +211,20 @@ typedef enum {
     TRANSPORT_TX_PIPE
 } transport_tx_kind_t;
 
+typedef enum {
+    TRANSPORT_RADIO_RX_IDLE = 0,
+    TRANSPORT_RADIO_RX_YIELD,
+    TRANSPORT_RADIO_TX_ACTIVE,
+    TRANSPORT_RADIO_TX_DRAINING
+} transport_radio_phase_t;
+
 typedef struct {
     bool active;
     bool last_packet;
+    bool drain_requested;
     uint8_t destination_id, slot, payload_length;
+    uint32_t staged_packets;
+    uint32_t staged_payload_bytes;
     transport_tx_kind_t kind;
 } transport_tx_record_t;
 
@@ -255,6 +271,11 @@ typedef struct {
     bool started;
     uint32_t sticky_errors;
     uint32_t application_tx_not_before_ms;
+    uint32_t rx_yield_started_ms, rx_yield_deadline_ms;
+    uint32_t tx_campaign_started_ms;
+    uint16_t max_continuous_tx_ms, forced_rx_ms;
+    bool tx_campaign_active;
+    transport_radio_phase_t radio_phase;
     transport_retry_record_t retry;
     transport_tx_record_t tx;
     transport_registration_tx_t registration_tx;
@@ -271,6 +292,8 @@ void transport_core_stop(transport_core_t *);
 /* Services every currently latched NRF interrupt and drains the RX FIFO. */
 void transport_core_on_radio_irq(transport_core_t *);
 void transport_core_service(transport_core_t *);
+bool transport_core_set_radio_schedule(transport_core_t *, uint16_t, uint16_t);
+void transport_core_get_radio_schedule(const transport_core_t *, uint16_t *, uint16_t *);
 
 bool transport_core_commit_command(transport_core_t *, uint8_t, uint8_t, uint16_t, size_t);
 bool transport_core_send_command(transport_core_t *, uint8_t, uint8_t, uint8_t,

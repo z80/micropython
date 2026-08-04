@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <string.h>
 
 #include "py/obj.h"
@@ -637,6 +638,35 @@ STATIC mp_obj_t mp_transport_core_poll_into(mp_obj_t self_in,
 STATIC MP_DEFINE_CONST_FUN_OBJ_2(transport_core_poll_into_obj,
     mp_transport_core_poll_into);
 
+STATIC mp_obj_t mp_transport_core_set_radio_schedule(mp_obj_t self_in,
+        mp_obj_t max_tx_ms_in, mp_obj_t rx_ms_in) {
+    mp_transport_core_obj_t *self = transport_core_from_obj(self_in);
+    mp_int_t max_tx_ms = mp_obj_get_int(max_tx_ms_in);
+    mp_int_t rx_ms = mp_obj_get_int(rx_ms_in);
+    if (max_tx_ms < 0 || max_tx_ms > UINT16_MAX ||
+            rx_ms < 0 || rx_ms > UINT16_MAX) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid radio schedule"));
+    }
+    transport_core_set_radio_schedule(&self->core, (uint16_t)max_tx_ms,
+        (uint16_t)rx_ms);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_3(transport_core_set_radio_schedule_obj,
+    mp_transport_core_set_radio_schedule);
+
+STATIC mp_obj_t mp_transport_core_get_radio_schedule(mp_obj_t self_in) {
+    mp_transport_core_obj_t *self = transport_core_from_obj(self_in);
+    uint16_t max_tx_ms;
+    uint16_t rx_ms;
+    mp_obj_t values[2];
+    transport_core_get_radio_schedule(&self->core, &max_tx_ms, &rx_ms);
+    values[0] = mp_obj_new_int_from_uint(max_tx_ms);
+    values[1] = mp_obj_new_int_from_uint(rx_ms);
+    return mp_obj_new_tuple(MP_ARRAY_SIZE(values), values);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(transport_core_get_radio_schedule_obj,
+    mp_transport_core_get_radio_schedule);
+
 STATIC mp_obj_t mp_transport_core_recommended_event_size(mp_obj_t self_in) {
     mp_transport_core_obj_t *self = transport_core_from_obj(self_in);
     size_t size = TRANSPORT_EVENT_HEADER_SIZE
@@ -727,6 +757,10 @@ STATIC const mp_rom_map_elem_t transport_core_locals_table[] = {
       MP_ROM_PTR(&transport_core_close_pipe_obj) },
     { MP_ROM_QSTR(MP_QSTR_poll_into),
       MP_ROM_PTR(&transport_core_poll_into_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_radio_schedule),
+      MP_ROM_PTR(&transport_core_set_radio_schedule_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_radio_schedule),
+      MP_ROM_PTR(&transport_core_get_radio_schedule_obj) },
     { MP_ROM_QSTR(MP_QSTR_recommended_event_size),
       MP_ROM_PTR(&transport_core_recommended_event_size_obj) },
     { MP_ROM_QSTR(MP_QSTR_sticky_errors),
