@@ -195,6 +195,7 @@ typedef struct {
     transport_pipe_state_t state;
     transport_direction_t direction;
     bool rx_event_pending, tx_space_event_pending, credit_update_pending;
+    bool close_event_pending;
 } transport_pipe_slot_t;
 
 typedef struct {

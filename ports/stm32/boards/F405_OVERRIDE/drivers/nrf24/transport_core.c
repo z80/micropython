@@ -747,6 +747,7 @@ static void core_reset_pipe(transport_pipe_slot_t *pipe) {
     pipe->rx_event_pending = false;
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
+    pipe->close_event_pending = false;
 }
 
 static void core_finish_outbound_pipe(transport_core_t *core, uint8_t slot,
@@ -771,6 +772,26 @@ static void core_finish_outbound_pipe(transport_core_t *core, uint8_t slot,
     if (closed) core->stats.pipes_closed++;
     else core->stats.pipes_failed++;
     if (!transport_core_emit(core, &event)) core_reset_pipe(pipe);
+}
+
+static bool core_emit_inbound_pipe_closed(transport_core_t *core,
+        uint8_t slot) {
+    transport_event_fields_t event;
+    transport_pipe_slot_t *pipe;
+    if (core == NULL || slot >= TRANSPORT_CORE_PIPE_SLOTS) return false;
+    pipe = &core->pipes[slot];
+    if (pipe->direction != TRANSPORT_DIRECTION_RX ||
+            pipe->state != TRANSPORT_PIPE_CLOSED ||
+            !pipe->close_event_pending) return false;
+    memset(&event, 0, sizeof(event));
+    event.type = TRANSPORT_EVENT_PIPE_CLOSED;
+    event.object_id = slot;
+    event.source_id = pipe->peer_id;
+    event.transaction_id = pipe->session_id;
+    event.value0 = pipe->transferred_bytes;
+    if (!transport_core_emit(core, &event)) return false;
+    pipe->close_event_pending = false;
+    return true;
 }
 
 bool transport_core_send_command(transport_core_t *core,
@@ -887,6 +908,7 @@ int transport_core_open_pipe(transport_core_t *core, uint8_t destination_id,
             pipe->rx_event_pending = false;
             pipe->tx_space_event_pending = false;
             pipe->credit_update_pending = false;
+            pipe->close_event_pending = false;
             break;
         }
     }
@@ -1086,6 +1108,7 @@ static void core_receive_pipe_intent(transport_core_t *core,
     pipe->rx_event_pending = false;
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
+    pipe->close_event_pending = false;
     pipe->lease_deadline_ms = core_now_ms(core) + core->config.pipe_lease_ms;
     if (!core_queue_cts(core, source_id, stream_id, TRANSPORT_WIRE_STREAM,
             TRANSPORT_CTS_ACCEPTED, pipe->granted_bytes)) {
@@ -1308,7 +1331,6 @@ static void core_receive_pipe_fragment(transport_core_t *core,
         size_t payload_length, bool last_packet) {
     int slot = core_find_pipe_slot(core, source_id, stream_id, false);
     transport_pipe_slot_t *pipe;
-    transport_event_fields_t event;
     if (slot < 0) {
         transport_core_report_error(core, TRANSPORT_ERROR_PROTOCOL,
             TRANSPORT_CORE_INVALID_ID, stream_id);
@@ -1331,14 +1353,9 @@ static void core_receive_pipe_fragment(transport_core_t *core,
     }
     if (last_packet) {
         pipe->state = TRANSPORT_PIPE_CLOSED;
-        memset(&event, 0, sizeof(event));
-        event.type = TRANSPORT_EVENT_PIPE_CLOSED;
-        event.object_id = (uint8_t)slot;
-        event.source_id = source_id;
-        event.transaction_id = stream_id;
-        event.value0 = pipe->transferred_bytes;
+        pipe->close_event_pending = true;
         core->stats.pipes_closed++;
-        (void)transport_core_emit(core, &event);
+        (void)core_emit_inbound_pipe_closed(core, (uint8_t)slot);
     }
 }
 
@@ -1837,7 +1854,11 @@ void transport_core_service(transport_core_t *core) {
     }
     for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
         transport_pipe_slot_t *pipe = &core->pipes[i];
-        if (core->config.pipe_lease_ms != 0 &&
+        if (pipe->direction == TRANSPORT_DIRECTION_RX &&
+                pipe->state == TRANSPORT_PIPE_CLOSED &&
+                pipe->close_event_pending) {
+            (void)core_emit_inbound_pipe_closed(core, i);
+        } else if (core->config.pipe_lease_ms != 0 &&
                 pipe->direction == TRANSPORT_DIRECTION_RX &&
                 (pipe->state == TRANSPORT_PIPE_CTS_SENT ||
                  pipe->state == TRANSPORT_PIPE_OPEN) &&
