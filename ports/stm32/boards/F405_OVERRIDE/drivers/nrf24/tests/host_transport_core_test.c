@@ -615,6 +615,57 @@ int main(void) {
         assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_FREE);
     }
 
+    /* Closing while the final data fragments are still staged must first
+       drain the data FIFO.  The terminal packet then starts as a fresh,
+       isolated FIFO batch. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        unsigned writes_after_data;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 47;
+        pipe->granted_bytes = sizeof(outbound);
+        pipe->transferred_bytes = 0;
+        pipe->direction = TRANSPORT_DIRECTION_TX;
+        pipe->state = TRANSPORT_PIPE_TX_OPEN;
+        pipe->lease_deadline_ms = fake_now + config.pipe_lease_ms;
+
+        assert(transport_core_pipe_tx_write(&core, 1, outbound,
+            sizeof(outbound)) == sizeof(outbound));
+        assert(fake_tx_count == 3);
+        writes_after_data = captured_tx_count;
+        assert(transport_core_close_pipe(&core, 1));
+        assert(captured_tx_count == writes_after_data);
+        assert(core.tx.active);
+        ack_tx(&core);
+        assert(core.tx.drain_requested);
+        assert(fake_tx_count == 2);
+        assert(captured_tx_count == writes_after_data);
+        assert(core.tx.active);
+        ack_tx(&core);
+        assert(fake_tx_count == 1);
+        assert(captured_tx_count == writes_after_data);
+        assert(core.tx.active);
+        ack_tx(&core);
+        assert(fake_tx_count == 1);
+        assert(captured_tx_count == writes_after_data + 1);
+        assert((captured_tx[4] & TRANSPORT_WIRE_LAST_PACKET) != 0);
+        assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 0);
+        assert(core.tx.active);
+        ack_tx(&core);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_TX_SPACE);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_CLOSED);
+        assert(transport_event_get_value0(event_buffer) == sizeof(outbound));
+    }
+
     /* A live pipe keeps the three-entry FIFO full.  A command to another
        peer requests draining, owns the FIFO next, and the pipe then resumes. */
     {
@@ -800,9 +851,11 @@ int main(void) {
     }
 
     /* An accepted outbound stream must retain an idle lease.  Otherwise a
-       vanished application can leave the slot allocated forever. */
+       vanished application can leave the slot allocated forever.  Its
+       failure event must also survive a temporarily full event queue. */
     {
         int pipe_id = transport_core_open_pipe(&core, 9, 45);
+        transport_event_fields_t filler;
         assert(pipe_id == 0);
         ack_tx(&core);
         make_cts(packet, config.network_id, 9, 1, 45,
@@ -813,8 +866,39 @@ int main(void) {
             TRANSPORT_POLL_EVENT);
         assert(transport_event_get_type(event_buffer) ==
             TRANSPORT_EVENT_PIPE_OPENED);
+        assert(transport_core_pipe_tx_write(&core, (uint8_t)pipe_id,
+            outbound, 10) == 10);
+        fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
+        ack_tx(&core);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_TX_SPACE);
+        memset(&filler, 0, sizeof(filler));
+        filler.type = TRANSPORT_EVENT_CORE_ERROR;
+        for (i = 0; i < TRANSPORT_CORE_EVENT_QUEUE_SIZE; ++i) {
+            assert(transport_core_emit(&core, &filler));
+        }
         fake_now += config.pipe_lease_ms;
         transport_core_service(&core);
+        assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_FAILED);
+        assert(core.pipes[pipe_id].close_event_pending);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_CORE_ERROR);
+        transport_core_service(&core);
+        assert(!core.pipes[pipe_id].close_event_pending);
+        for (i = 1; i < TRANSPORT_CORE_EVENT_QUEUE_SIZE; ++i) {
+            assert(transport_core_poll_into(&core, event_buffer,
+                sizeof(event_buffer), &event_length, &required) ==
+                TRANSPORT_POLL_EVENT);
+            assert(transport_event_get_type(event_buffer) ==
+                TRANSPORT_EVENT_CORE_ERROR);
+        }
         assert(transport_core_poll_into(&core, event_buffer,
             sizeof(event_buffer), &event_length, &required) ==
             TRANSPORT_POLL_EVENT);
@@ -822,11 +906,12 @@ int main(void) {
             TRANSPORT_EVENT_PIPE_FAILED);
         assert(transport_event_get_value0(event_buffer) ==
             TRANSPORT_PIPE_FAILURE_TIMEOUT);
+        assert(transport_event_get_value1(event_buffer) == 10);
         assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_FREE);
     }
 
     assert(core.stats.pipes_opened == 5);
-    assert(core.stats.pipes_closed == 5);
+    assert(core.stats.pipes_closed == 6);
     assert(core.stats.pipes_failed == 3);
 
     /* A continuously supplied pipe drains at the fairness deadline, remains

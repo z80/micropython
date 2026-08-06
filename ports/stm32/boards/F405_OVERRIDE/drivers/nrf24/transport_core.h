@@ -196,6 +196,7 @@ typedef struct {
     transport_direction_t direction;
     bool rx_event_pending, tx_space_event_pending, credit_update_pending;
     bool close_event_pending;
+    uint32_t terminal_event_reason;
 } transport_pipe_slot_t;
 
 typedef struct {

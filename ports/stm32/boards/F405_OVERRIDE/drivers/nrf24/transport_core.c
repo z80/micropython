@@ -17,6 +17,7 @@ static void core_finish_outbound_pipe(transport_core_t *, uint8_t, bool,
     uint32_t);
 static void core_finish_registration_tx(transport_core_t *, bool, uint32_t);
 static bool queue_pipe_tx_space_event(transport_core_t *, uint8_t);
+static bool core_emit_pipe_terminal(transport_core_t *, uint8_t);
 
 static uint32_t core_now_ms(transport_core_t *core) {
     if (core->config.radio.ticks_ms == NULL) return 0;
@@ -238,6 +239,15 @@ static bool core_fill_tx_owner(transport_core_t *core) {
                 (void)queue_pipe_tx_space_event(core, core->tx.slot);
             } else if (pipe->state == TRANSPORT_PIPE_TX_CLOSING &&
                     remaining == 0) {
+                /* Never append the terminal packet behind pipe data already
+                   in the hardware FIFO.  Drain and commit that data batch;
+                   core_tx_kick() will then give the close packet its own
+                   FIFO ownership period. */
+                if (core->tx.staged_payload_bytes != 0) {
+                    core->tx.drain_requested = true;
+                    core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
+                    break;
+                }
                 if (!core_build_packet(core, TRANSPORT_WIRE_STREAM,
                         pipe->peer_id, (uint8_t)pipe->session_id,
                         TRANSPORT_WIRE_LAST_PACKET, NULL, 0, packet) ||
@@ -748,47 +758,46 @@ static void core_reset_pipe(transport_pipe_slot_t *pipe) {
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
     pipe->close_event_pending = false;
+    pipe->terminal_event_reason = 0;
 }
 
 static void core_finish_outbound_pipe(transport_core_t *core, uint8_t slot,
         bool closed, uint32_t reason) {
-    transport_event_fields_t event;
     transport_pipe_slot_t *pipe;
     if (core == NULL || slot >= TRANSPORT_CORE_PIPE_SLOTS) return;
     pipe = &core->pipes[slot];
     if (pipe->direction != TRANSPORT_DIRECTION_TX) return;
-    memset(&event, 0, sizeof(event));
-    event.type = closed ? TRANSPORT_EVENT_PIPE_CLOSED :
-        TRANSPORT_EVENT_PIPE_FAILED;
-    event.flags = TRANSPORT_EVENT_FLAG_TX;
-    event.object_id = slot;
-    event.source_id = pipe->peer_id;
-    event.transaction_id = pipe->session_id;
-    event.value0 = closed ? pipe->transferred_bytes : reason;
-    event.value1 = closed ? 0 : pipe->transferred_bytes;
-    pipe->direction = TRANSPORT_DIRECTION_NONE;
     pipe->state = closed ? TRANSPORT_PIPE_CLOSED : TRANSPORT_PIPE_FAILED;
     pipe->tx_space_event_pending = false;
+    pipe->close_event_pending = true;
+    pipe->terminal_event_reason = reason;
     if (closed) core->stats.pipes_closed++;
     else core->stats.pipes_failed++;
-    if (!transport_core_emit(core, &event)) core_reset_pipe(pipe);
+    (void)core_emit_pipe_terminal(core, slot);
 }
 
-static bool core_emit_inbound_pipe_closed(transport_core_t *core,
-        uint8_t slot) {
+static bool core_emit_pipe_terminal(transport_core_t *core, uint8_t slot) {
     transport_event_fields_t event;
     transport_pipe_slot_t *pipe;
     if (core == NULL || slot >= TRANSPORT_CORE_PIPE_SLOTS) return false;
     pipe = &core->pipes[slot];
-    if (pipe->direction != TRANSPORT_DIRECTION_RX ||
-            pipe->state != TRANSPORT_PIPE_CLOSED ||
+    if ((pipe->direction != TRANSPORT_DIRECTION_RX &&
+            pipe->direction != TRANSPORT_DIRECTION_TX) ||
+            (pipe->state != TRANSPORT_PIPE_CLOSED &&
+             pipe->state != TRANSPORT_PIPE_FAILED) ||
             !pipe->close_event_pending) return false;
     memset(&event, 0, sizeof(event));
-    event.type = TRANSPORT_EVENT_PIPE_CLOSED;
+    event.type = pipe->state == TRANSPORT_PIPE_CLOSED ?
+        TRANSPORT_EVENT_PIPE_CLOSED : TRANSPORT_EVENT_PIPE_FAILED;
+    if (pipe->direction == TRANSPORT_DIRECTION_TX)
+        event.flags = TRANSPORT_EVENT_FLAG_TX;
     event.object_id = slot;
     event.source_id = pipe->peer_id;
     event.transaction_id = pipe->session_id;
-    event.value0 = pipe->transferred_bytes;
+    event.value0 = pipe->state == TRANSPORT_PIPE_CLOSED ?
+        pipe->transferred_bytes : pipe->terminal_event_reason;
+    event.value1 = pipe->state == TRANSPORT_PIPE_FAILED ?
+        pipe->transferred_bytes : 0;
     if (!transport_core_emit(core, &event)) return false;
     pipe->close_event_pending = false;
     return true;
@@ -909,6 +918,7 @@ int transport_core_open_pipe(transport_core_t *core, uint8_t destination_id,
             pipe->tx_space_event_pending = false;
             pipe->credit_update_pending = false;
             pipe->close_event_pending = false;
+            pipe->terminal_event_reason = 0;
             break;
         }
     }
@@ -1109,6 +1119,7 @@ static void core_receive_pipe_intent(transport_core_t *core,
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
     pipe->close_event_pending = false;
+    pipe->terminal_event_reason = 0;
     pipe->lease_deadline_ms = core_now_ms(core) + core->config.pipe_lease_ms;
     if (!core_queue_cts(core, source_id, stream_id, TRANSPORT_WIRE_STREAM,
             TRANSPORT_CTS_ACCEPTED, pipe->granted_bytes)) {
@@ -1342,6 +1353,10 @@ static void core_receive_pipe_fragment(transport_core_t *core,
     if ((uint32_t)payload_length >
             pipe->granted_bytes - pipe->transferred_bytes) {
         pipe->state = TRANSPORT_PIPE_FAILED;
+        pipe->close_event_pending = true;
+        pipe->terminal_event_reason = TRANSPORT_ERROR_RX_OVERRUN;
+        core->stats.pipes_failed++;
+        (void)core_emit_pipe_terminal(core, (uint8_t)slot);
         transport_core_report_error(core, TRANSPORT_ERROR_RX_OVERRUN,
             (uint8_t)slot, (uint32_t)payload_length);
         return;
@@ -1349,13 +1364,25 @@ static void core_receive_pipe_fragment(transport_core_t *core,
     if (payload_length != 0 && transport_core_pipe_rx_write(core,
             (uint8_t)slot, payload, payload_length) != payload_length) {
         pipe->state = TRANSPORT_PIPE_FAILED;
+        pipe->close_event_pending = true;
+        pipe->terminal_event_reason = TRANSPORT_ERROR_RX_OVERRUN;
+        core->stats.pipes_failed++;
+        (void)core_emit_pipe_terminal(core, (uint8_t)slot);
+        return;
+    }
+    if (pipe->state == TRANSPORT_PIPE_FAILED) {
+        pipe->close_event_pending = true;
+        pipe->terminal_event_reason = TRANSPORT_ERROR_RX_OVERRUN;
+        core->stats.pipes_failed++;
+        (void)core_emit_pipe_terminal(core, (uint8_t)slot);
         return;
     }
     if (last_packet) {
         pipe->state = TRANSPORT_PIPE_CLOSED;
         pipe->close_event_pending = true;
+        pipe->terminal_event_reason = 0;
         core->stats.pipes_closed++;
-        (void)core_emit_inbound_pipe_closed(core, (uint8_t)slot);
+        (void)core_emit_pipe_terminal(core, (uint8_t)slot);
     }
 }
 
@@ -1854,30 +1881,22 @@ void transport_core_service(transport_core_t *core) {
     }
     for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
         transport_pipe_slot_t *pipe = &core->pipes[i];
-        if (pipe->direction == TRANSPORT_DIRECTION_RX &&
-                pipe->state == TRANSPORT_PIPE_CLOSED &&
+        if ((pipe->state == TRANSPORT_PIPE_CLOSED ||
+                pipe->state == TRANSPORT_PIPE_FAILED) &&
                 pipe->close_event_pending) {
-            (void)core_emit_inbound_pipe_closed(core, i);
+            (void)core_emit_pipe_terminal(core, i);
         } else if (core->config.pipe_lease_ms != 0 &&
                 pipe->direction == TRANSPORT_DIRECTION_RX &&
                 (pipe->state == TRANSPORT_PIPE_CTS_SENT ||
                  pipe->state == TRANSPORT_PIPE_OPEN) &&
                 core_deadline_reached(now, pipe->lease_deadline_ms)) {
-            transport_event_fields_t event;
             transport_ring_reset(&pipe->buffer);
             pipe->rx_event_pending = false;
             pipe->state = TRANSPORT_PIPE_FAILED;
-            memset(&event, 0, sizeof(event));
-            event.type = TRANSPORT_EVENT_PIPE_FAILED;
-            event.object_id = i;
-            event.source_id = pipe->peer_id;
-            event.transaction_id = pipe->session_id;
-            event.value0 = TRANSPORT_ERROR_PIPE_TIMEOUT;
-            if (!transport_core_emit(core, &event)) {
-                transport_core_report_error(core,
-                    TRANSPORT_ERROR_EVENT_QUEUE_OVERFLOW, i,
-                    TRANSPORT_ERROR_PIPE_TIMEOUT);
-            }
+            pipe->close_event_pending = true;
+            pipe->terminal_event_reason = TRANSPORT_ERROR_PIPE_TIMEOUT;
+            core->stats.pipes_failed++;
+            (void)core_emit_pipe_terminal(core, i);
         } else if (core->config.pipe_lease_ms != 0 &&
                 pipe->direction == TRANSPORT_DIRECTION_TX &&
                 (pipe->state == TRANSPORT_PIPE_TX_WAIT_CTS ||
