@@ -75,6 +75,7 @@
 #define TRANSPORT_WIRE_ENUM_CONFIRM 8u
 #define TRANSPORT_WIRE_CTS 9u
 #define TRANSPORT_WIRE_PIPE_CLOSE_ACK 10u
+#define TRANSPORT_WIRE_PIPE_CREDIT_REQUEST 11u
 
 typedef enum {
     TRANSPORT_REGISTRATION_FAILURE_RADIO = 1
@@ -193,12 +194,13 @@ typedef struct {
     uint8_t peer_id;
     uint16_t session_id;
     uint32_t granted_bytes, transferred_bytes;
-    uint32_t lease_deadline_ms, close_retry_at_ms;
+    uint32_t lease_deadline_ms, close_retry_at_ms, credit_request_at_ms;
     transport_pipe_state_t state;
     transport_direction_t direction;
     bool rx_event_pending, tx_space_event_pending, credit_update_pending;
     bool close_event_pending, close_ack_pending, close_ack_queued;
     bool close_ack_wait_duplicate;
+    bool credit_request_queued, credit_wait_request;
     bool terminal_event_polled;
     uint32_t terminal_event_reason;
 } transport_pipe_slot_t;

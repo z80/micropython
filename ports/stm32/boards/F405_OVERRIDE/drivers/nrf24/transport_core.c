@@ -24,6 +24,8 @@ static bool core_queue_pipe_close_ack(transport_core_t *, uint8_t);
 static int core_find_pipe_close_tombstone(transport_core_t *, uint8_t,
     uint8_t);
 static bool core_queue_tombstone_close_ack(transport_core_t *, uint8_t);
+static void core_maybe_queue_tx_credit_request(transport_core_t *, uint8_t,
+    uint32_t);
 
 static uint32_t core_now_ms(transport_core_t *core) {
     if (core->config.radio.ticks_ms == NULL) return 0;
@@ -628,7 +630,8 @@ static void core_maybe_queue_rx_credit(transport_core_t *core,
     uint32_t desired;
     if (pipe->direction != TRANSPORT_DIRECTION_RX ||
             pipe->state != TRANSPORT_PIPE_OPEN ||
-            pipe->credit_update_pending || pipe->rx_event_pending) {
+            pipe->credit_update_pending || pipe->credit_wait_request ||
+            pipe->rx_event_pending) {
         return;
     }
     /* Do not turn the half-duplex receiver around while the peer can still
@@ -640,7 +643,48 @@ static void core_maybe_queue_rx_credit(transport_core_t *core,
     if (desired == pipe->granted_bytes) return;
     if (core_queue_cts(core, pipe->peer_id, (uint8_t)pipe->session_id,
             TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, desired)) {
+        /* Commit cumulative credit when the CTS is queued.  The peer may
+           receive it even if the radio later reports MAX_RT because the
+           hardware acknowledgement was lost.  A credit request makes the
+           update idempotently repeatable in either case. */
+        pipe->granted_bytes = desired;
         pipe->credit_update_pending = true;
+    }
+}
+
+static void core_maybe_queue_tx_credit_request(transport_core_t *core,
+        uint8_t pipe_id, uint32_t now) {
+    transport_pipe_slot_t *pipe = &core->pipes[pipe_id];
+    uint32_t used_credit;
+    bool needs_credit;
+    if (pipe->direction != TRANSPORT_DIRECTION_TX ||
+            (pipe->state != TRANSPORT_PIPE_TX_OPEN &&
+             pipe->state != TRANSPORT_PIPE_TX_CLOSING)) {
+        return;
+    }
+    used_credit = pipe->transferred_bytes;
+    if (core->tx.active && core->tx.kind == TRANSPORT_TX_PIPE &&
+            core->tx.slot == pipe_id) {
+        used_credit += core->tx.staged_payload_bytes;
+    }
+    needs_credit = transport_ring_readable(&pipe->buffer) != 0 ||
+        pipe->state == TRANSPORT_PIPE_TX_CLOSING;
+    if (!needs_credit || pipe->granted_bytes > used_credit) {
+        if (!pipe->credit_request_queued) pipe->credit_request_at_ms = 0;
+        return;
+    }
+    if (pipe->credit_request_queued) return;
+    if (pipe->credit_request_at_ms == 0) {
+        pipe->credit_request_at_ms = now +
+            core_pipe_close_retry_delay(core);
+        return;
+    }
+    if (!core_deadline_reached(now, pipe->credit_request_at_ms)) return;
+    if (core_queue_packet(core, TRANSPORT_WIRE_PIPE_CREDIT_REQUEST,
+            pipe->peer_id, (uint8_t)pipe->session_id,
+            TRANSPORT_WIRE_LAST_PACKET, NULL, 0)) {
+        pipe->credit_request_queued = true;
+        pipe->credit_request_at_ms = 0;
     }
 }
 
@@ -771,6 +815,7 @@ static void core_reset_pipe(transport_pipe_slot_t *pipe) {
     pipe->transferred_bytes = 0;
     pipe->lease_deadline_ms = 0;
     pipe->close_retry_at_ms = 0;
+    pipe->credit_request_at_ms = 0;
     pipe->rx_event_pending = false;
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
@@ -778,6 +823,8 @@ static void core_reset_pipe(transport_pipe_slot_t *pipe) {
     pipe->close_ack_pending = false;
     pipe->close_ack_queued = false;
     pipe->close_ack_wait_duplicate = false;
+    pipe->credit_request_queued = false;
+    pipe->credit_wait_request = false;
     pipe->terminal_event_polled = false;
     pipe->terminal_event_reason = 0;
 }
@@ -1025,6 +1072,9 @@ int transport_core_open_pipe(transport_core_t *core, uint8_t destination_id,
             pipe->close_ack_wait_duplicate = false;
             pipe->terminal_event_polled = false;
             pipe->close_retry_at_ms = 0;
+            pipe->credit_request_at_ms = 0;
+            pipe->credit_request_queued = false;
+            pipe->credit_wait_request = false;
             pipe->terminal_event_reason = 0;
             break;
         }
@@ -1243,6 +1293,9 @@ static void core_receive_pipe_intent(transport_core_t *core,
     pipe->close_ack_wait_duplicate = false;
     pipe->terminal_event_polled = false;
     pipe->close_retry_at_ms = 0;
+    pipe->credit_request_at_ms = 0;
+    pipe->credit_request_queued = false;
+    pipe->credit_wait_request = false;
     pipe->terminal_event_reason = 0;
     pipe->lease_deadline_ms = core_now_ms(core) + core->config.pipe_lease_ms;
     if (!core_queue_cts(core, source_id, stream_id, TRANSPORT_WIRE_STREAM,
@@ -1261,6 +1314,15 @@ static void core_control_acked(transport_core_t *core, const uint8_t *packet) {
     packet_type = packet[0] & TRANSPORT_WIRE_TYPE_MASK;
     peer_id = packet[2];
     message_id = packet[3];
+    if (packet_type == TRANSPORT_WIRE_PIPE_CREDIT_REQUEST) {
+        slot = core_find_outbound_pipe(core, peer_id, message_id);
+        if (slot >= 0) {
+            core->pipes[slot].credit_request_queued = false;
+            core->pipes[slot].credit_request_at_ms = core_now_ms(core) +
+                core_pipe_close_retry_delay(core);
+        }
+        return;
+    }
     if (packet_type == TRANSPORT_WIRE_PIPE_CLOSE_ACK) {
         slot = core_find_pipe_slot(core, peer_id, message_id, false);
         if (slot >= 0 && core->pipes[slot].direction == TRANSPORT_DIRECTION_RX &&
@@ -1328,6 +1390,7 @@ static void core_control_acked(transport_core_t *core, const uint8_t *packet) {
             core->pipes[slot].granted_bytes =
                 core_read_le32(packet + TRANSPORT_WIRE_HEADER_SIZE + 2);
             core->pipes[slot].credit_update_pending = false;
+            core->pipes[slot].credit_wait_request = false;
             return;
         }
         if (core->pipes[slot].state != TRANSPORT_PIPE_CTS_SENT) return;
@@ -1351,6 +1414,15 @@ static void core_control_failed(transport_core_t *core,
     packet_type = packet[0] & TRANSPORT_WIRE_TYPE_MASK;
     peer_id = packet[2];
     message_id = packet[3];
+    if (packet_type == TRANSPORT_WIRE_PIPE_CREDIT_REQUEST) {
+        slot = core_find_outbound_pipe(core, peer_id, message_id);
+        if (slot >= 0) {
+            core->pipes[slot].credit_request_queued = false;
+            core->pipes[slot].credit_request_at_ms = core_now_ms(core) +
+                core_pipe_close_retry_delay(core);
+        }
+        return;
+    }
     if (packet_type == TRANSPORT_WIRE_PIPE_CLOSE_ACK) {
         slot = core_find_pipe_slot(core, peer_id, message_id, false);
         if (slot >= 0 && core->pipes[slot].direction == TRANSPORT_DIRECTION_RX &&
@@ -1401,6 +1473,7 @@ static void core_control_failed(transport_core_t *core,
         if (slot >= 0) {
             if (core->pipes[slot].state == TRANSPORT_PIPE_OPEN) {
                 core->pipes[slot].credit_update_pending = false;
+                core->pipes[slot].credit_wait_request = true;
             } else {
                 core_reset_pipe(&core->pipes[slot]);
             }
@@ -1440,6 +1513,8 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
             }
             pipe->granted_bytes = value;
             pipe->transferred_bytes = 0;
+            pipe->credit_request_at_ms = 0;
+            pipe->credit_request_queued = false;
             pipe->state = TRANSPORT_PIPE_TX_OPEN;
             core->application_tx_not_before_ms = core_now_ms(core) +
                 TRANSPORT_CORE_CTS_TURNAROUND_MS;
@@ -1466,12 +1541,20 @@ static void core_receive_cts(transport_core_t *core, uint8_t source_id,
         if (delta != 0 && delta < 0x80000000u &&
                 delta <= pipe->buffer.capacity) {
             pipe->granted_bytes = value;
+            pipe->credit_request_at_ms = 0;
+            pipe->credit_request_queued = false;
             core->application_tx_not_before_ms = core_now_ms(core) +
                 TRANSPORT_CORE_CTS_TURNAROUND_MS;
             if (core->config.pipe_lease_ms != 0) {
                 pipe->lease_deadline_ms = core_now_ms(core) +
                     core->config.pipe_lease_ms;
             }
+        } else if (delta == 0) {
+            pipe->credit_request_at_ms = core_now_ms(core) +
+                core_pipe_close_retry_delay(core);
+            pipe->credit_request_queued = false;
+            core->application_tx_not_before_ms = core_now_ms(core) +
+                TRANSPORT_CORE_CTS_TURNAROUND_MS;
         }
         return;
     }
@@ -1534,6 +1617,7 @@ static void core_receive_pipe_fragment(transport_core_t *core,
         return;
     }
     pipe->state = TRANSPORT_PIPE_OPEN;
+    pipe->credit_wait_request = false;
     pipe->lease_deadline_ms = core_now_ms(core) + core->config.pipe_lease_ms;
     if ((uint32_t)payload_length >
             pipe->granted_bytes - pipe->transferred_bytes) {
@@ -1590,6 +1674,40 @@ static void core_receive_pipe_close_ack(transport_core_t *core,
     pipe = &core->pipes[slot];
     if (pipe->state != TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK) return;
     core_finish_outbound_pipe(core, (uint8_t)slot, true, 0);
+}
+
+static void core_receive_pipe_credit_request(transport_core_t *core,
+        uint8_t source_id, uint8_t stream_id, size_t payload_length,
+        bool last_packet) {
+    int slot;
+    transport_pipe_slot_t *pipe;
+    uint32_t desired, delta;
+    if (!last_packet || payload_length != 0) {
+        core->stats.protocol_errors++;
+        return;
+    }
+    slot = core_find_pipe_slot(core, source_id, stream_id, false);
+    if (slot < 0) return;
+    pipe = &core->pipes[slot];
+    if (pipe->direction != TRANSPORT_DIRECTION_RX ||
+            pipe->state != TRANSPORT_PIPE_OPEN) {
+        return;
+    }
+    if (core->config.pipe_lease_ms != 0) {
+        pipe->lease_deadline_ms = core_now_ms(core) +
+            core->config.pipe_lease_ms;
+    }
+    pipe->credit_wait_request = false;
+    if (pipe->credit_update_pending) return;
+    desired = pipe->transferred_bytes +
+        (uint32_t)transport_ring_writable(&pipe->buffer);
+    delta = desired - pipe->granted_bytes;
+    if (delta >= 0x80000000u) desired = pipe->granted_bytes;
+    if (core_queue_cts(core, pipe->peer_id, (uint8_t)pipe->session_id,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, desired)) {
+        pipe->granted_bytes = desired;
+        pipe->credit_update_pending = true;
+    }
 }
 
 static void core_receive_packet(transport_core_t *core, const uint8_t *packet,
@@ -1654,6 +1772,9 @@ static void core_receive_packet(transport_core_t *core, const uint8_t *packet,
             packet + TRANSPORT_WIRE_HEADER_SIZE, payload_length, last_packet);
     } else if (message_type == TRANSPORT_WIRE_PIPE_CLOSE_ACK && !intent) {
         core_receive_pipe_close_ack(core, source_id, message_id,
+            payload_length, last_packet);
+    } else if (message_type == TRANSPORT_WIRE_PIPE_CREDIT_REQUEST && !intent) {
+        core_receive_pipe_credit_request(core, source_id, message_id,
             payload_length, last_packet);
     } else if (core_is_command_type(message_type) && intent) {
         core_receive_command_intent(core, message_type, source_id, message_id,
@@ -1909,7 +2030,7 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                     NRF24_STATUS_MAX_RT | NRF24_STATUS_TX_DS);
                 nrf24_set_ce(radio, true);
             } else {
-                bool retry_pipe_close = false;
+                bool retry_control = false;
                 core->retry.state = TRANSPORT_RETRY_EXHAUSTED;
                 nrf24_abort_send(radio);
                 if (core->tx.active) {
@@ -1919,8 +2040,10 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                                 sizeof(packet)) == sizeof(packet)) {
                             core_control_failed(core, packet);
                             if ((packet[0] & TRANSPORT_WIRE_TYPE_MASK) ==
-                                    TRANSPORT_WIRE_PIPE_CLOSE_ACK) {
-                                retry_pipe_close = true;
+                                    TRANSPORT_WIRE_PIPE_CLOSE_ACK ||
+                                    (packet[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+                                    TRANSPORT_WIRE_PIPE_CREDIT_REQUEST) {
+                                retry_control = true;
                             }
                         }
                         (void)transport_ring_discard(&core->control_tx,
@@ -1943,7 +2066,7 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                             pipe->state = TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK;
                             pipe->close_retry_at_ms = now +
                                 core_pipe_close_retry_delay(core);
-                            retry_pipe_close = true;
+                            retry_control = true;
                         } else {
                             core_finish_outbound_pipe(core, core->tx.slot,
                                 false, TRANSPORT_PIPE_FAILURE_RADIO);
@@ -1951,7 +2074,7 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                     }
                     core_release_tx_owner(core);
                 }
-                if (!retry_pipe_close) {
+                if (!retry_control) {
                     transport_core_report_error(core, TRANSPORT_ERROR_RADIO,
                         TRANSPORT_CORE_INVALID_ID, NRF24_STATUS_MAX_RT);
                 }
@@ -2153,16 +2276,34 @@ void transport_core_service(transport_core_t *core) {
                 nrf24_abort_send(core->config.radio.radio);
                 core_release_tx_owner(core);
                 core_exit(core, abort_critical);
+            } else if (core->tx.active &&
+                    core->tx.kind == TRANSPORT_TX_CONTROL) {
+                uint8_t packet[NRF24_MAX_PAYLOAD];
+                if (transport_ring_peek(&core->control_tx, packet,
+                        sizeof(packet)) == sizeof(packet) &&
+                        (packet[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+                            TRANSPORT_WIRE_PIPE_CREDIT_REQUEST &&
+                        packet[2] == pipe->peer_id &&
+                        packet[3] == (uint8_t)pipe->session_id) {
+                    transport_critical_state_t abort_critical =
+                        core_enter(core);
+                    nrf24_abort_send(core->config.radio.radio);
+                    (void)transport_ring_discard(&core->control_tx,
+                        TRANSPORT_CONTROL_RECORD_SIZE);
+                    core_release_tx_owner(core);
+                    core_exit(core, abort_critical);
+                }
             }
             core_finish_outbound_pipe(core, i, false,
                 TRANSPORT_PIPE_FAILURE_TIMEOUT);
-            core_restore_rx(core);
+            if (!core->tx.active) core_restore_rx(core);
         } else if (pipe->direction == TRANSPORT_DIRECTION_TX &&
                 pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK &&
                 core_deadline_reached(now, pipe->close_retry_at_ms)) {
             pipe->state = TRANSPORT_PIPE_TX_CLOSING;
         } else {
             core_maybe_queue_rx_credit(core, i);
+            core_maybe_queue_tx_credit_request(core, i, now);
         }
     }
     for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {

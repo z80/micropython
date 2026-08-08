@@ -696,6 +696,255 @@ int main(void) {
         assert(transport_event_get_value0(event_buffer) == sizeof(outbound));
     }
 
+    /* If a cumulative credit CTS is lost, the sender must remain alive at
+       the exact boundary and ask the receiver to repeat its current grant.
+       A same-credit answer does not create progress, but safely schedules
+       another request instead of spinning or abandoning the pipe. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        uint8_t one = 0xa5;
+        uint32_t retry_delay = core.config.max_rt_window_ms +
+            TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        core.config.pipe_lease_ms = 500;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 60;
+        pipe->granted_bytes = 1;
+        pipe->transferred_bytes = 0;
+        pipe->direction = TRANSPORT_DIRECTION_TX;
+        pipe->state = TRANSPORT_PIPE_TX_OPEN;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+        pipe->credit_request_at_ms = 0;
+        pipe->credit_request_queued = false;
+
+        assert(transport_core_pipe_tx_write(&core, 1, &one, 1) == 1);
+        ack_tx(&core);
+        assert(pipe->transferred_bytes == pipe->granted_bytes);
+        assert(!core.tx.active);
+        assert(pipe->credit_request_at_ms == fake_now + retry_delay);
+        fake_now += retry_delay - 1;
+        transport_core_service(&core);
+        assert(!core.tx.active);
+        fake_now++;
+        transport_core_service(&core);
+        assert(core.tx.kind == TRANSPORT_TX_CONTROL);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_PIPE_CREDIT_REQUEST);
+        assert((captured_tx[4] & TRANSPORT_WIRE_LAST_PACKET) != 0);
+        assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 0);
+        ack_tx(&core);
+        assert(!pipe->credit_request_queued);
+
+        make_cts(packet, config.network_id, 9, 1, 60,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, 1);
+        deliver(&core, packet);
+        assert(pipe->granted_bytes == 1);
+        assert(pipe->credit_request_at_ms == fake_now + retry_delay);
+
+        make_cts(packet, config.network_id, 9, 1, 60,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED, 2);
+        deliver(&core, packet);
+        assert(pipe->granted_bytes == 2);
+        assert(pipe->credit_request_at_ms == 0);
+        pipe->state = TRANSPORT_PIPE_FAILED;
+        pipe->close_event_pending = true;
+        pipe->terminal_event_reason = TRANSPORT_PIPE_FAILURE_TIMEOUT;
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_TX_SPACE);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
+    /* A lease timeout while the recovery request itself owns the radio must
+       release both the control record and TX owner.  Otherwise every later
+       pipe open observes a permanently busy transport. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        uint32_t retry_delay = core.config.max_rt_window_ms +
+            TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        core.config.pipe_lease_ms = 500;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 62;
+        pipe->granted_bytes = 1;
+        pipe->transferred_bytes = 1;
+        pipe->direction = TRANSPORT_DIRECTION_TX;
+        pipe->state = TRANSPORT_PIPE_TX_CLOSING;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+        pipe->credit_request_at_ms = fake_now + retry_delay;
+        pipe->credit_request_queued = false;
+
+        fake_now += retry_delay;
+        transport_core_service(&core);
+        assert(core.tx.active && core.tx.kind == TRANSPORT_TX_CONTROL);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_PIPE_CREDIT_REQUEST);
+
+        /* Exhausting the request's hardware retry campaign is recoverable
+           and does not produce a generic radio failure event. */
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        fake_now += core.config.max_rt_window_ms;
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!core.tx.active);
+        assert(pipe->state == TRANSPORT_PIPE_TX_CLOSING);
+        assert(pipe->credit_request_at_ms == fake_now + retry_delay);
+        assert(core.event_read == core.event_write);
+
+        fake_now += retry_delay;
+        transport_core_service(&core);
+        assert(core.tx.active && core.tx.kind == TRANSPORT_TX_CONTROL);
+        pipe->lease_deadline_ms = fake_now;
+        transport_core_service(&core);
+        assert(!core.tx.active);
+        assert(fake_rx_mode);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+
+        /* Prove that the timeout removed the global busy condition, not just
+           the visible slot state. */
+        assert(transport_core_open_pipe(&core, 9, 63) == 1);
+        ack_tx(&core);
+        make_cts(packet, config.network_id, 9, 1, 63,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_BUSY, 0);
+        deliver(&core, packet);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(core.pipes[1].state == TRANSPORT_PIPE_FREE);
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
+    /* A receiver whose replenishment CTS exhausts MAX_RT waits passively
+       instead of immediately colliding with the sender.  A later explicit
+       request repeats the cumulative grant and keeps the slot reusable. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        uint32_t expected_grant;
+        core.config.pipe_lease_ms = 500;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 61;
+        pipe->granted_bytes = 32;
+        pipe->transferred_bytes = 32;
+        pipe->direction = TRANSPORT_DIRECTION_RX;
+        pipe->state = TRANSPORT_PIPE_OPEN;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+        pipe->credit_update_pending = false;
+        pipe->credit_wait_request = false;
+        pipe->rx_event_pending = false;
+
+        transport_core_service(&core);
+        expected_grant = 32 + (uint32_t)pipe->buffer.capacity;
+        assert(pipe->granted_bytes == expected_grant);
+        assert(pipe->credit_update_pending);
+        assert(core.tx.kind == TRANSPORT_TX_CONTROL);
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        fake_now += core.config.max_rt_window_ms;
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!pipe->credit_update_pending);
+        assert(pipe->credit_wait_request);
+        transport_core_service(&core);
+        assert(!core.tx.active);
+
+        make_packet(packet, config.network_id,
+            TRANSPORT_WIRE_PIPE_CREDIT_REQUEST, 9, 1, 61,
+            TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(!pipe->credit_wait_request);
+        assert(pipe->credit_update_pending);
+        assert(pipe->granted_bytes == expected_grant);
+        assert(core.tx.kind == TRANSPORT_TX_CONTROL);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_CTS);
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        fake_now += core.config.max_rt_window_ms;
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!pipe->credit_update_pending);
+        assert(pipe->credit_wait_request);
+        assert(!core.tx.active);
+
+        /* A second request recovers after the response CTS itself failed. */
+        make_packet(packet, config.network_id,
+            TRANSPORT_WIRE_PIPE_CREDIT_REQUEST, 9, 1, 61,
+            TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(pipe->credit_update_pending);
+        assert(!pipe->credit_wait_request);
+        ack_tx(&core);
+        assert(!pipe->credit_update_pending);
+
+        /* Cumulative byte counters use modular arithmetic.  Repeating credit
+           must remain valid when the next grant wraps through zero. */
+        pipe->transferred_bytes = UINT32_MAX - 10u;
+        pipe->granted_bytes = pipe->transferred_bytes;
+        pipe->credit_wait_request = true;
+        expected_grant = pipe->transferred_bytes +
+            (uint32_t)pipe->buffer.capacity;
+        make_packet(packet, config.network_id,
+            TRANSPORT_WIRE_PIPE_CREDIT_REQUEST, 9, 1, 61,
+            TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(pipe->granted_bytes == expected_grant);
+        assert(core.tx.kind == TRANSPORT_TX_CONTROL);
+        assert(captured_tx[TRANSPORT_WIRE_HEADER_SIZE + 2] ==
+            (uint8_t)expected_grant);
+        assert(captured_tx[TRANSPORT_WIRE_HEADER_SIZE + 3] ==
+            (uint8_t)(expected_grant >> 8));
+        assert(captured_tx[TRANSPORT_WIRE_HEADER_SIZE + 4] ==
+            (uint8_t)(expected_grant >> 16));
+        assert(captured_tx[TRANSPORT_WIRE_HEADER_SIZE + 5] ==
+            (uint8_t)(expected_grant >> 24));
+        ack_tx(&core);
+
+        /* Consume the expected diagnostic from the deliberately failed CTS,
+           then release the synthetic receiver slot through its normal
+           terminal-event lifecycle. */
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_CORE_ERROR);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_CORE_ERROR);
+        pipe->state = TRANSPORT_PIPE_FAILED;
+        pipe->close_event_pending = true;
+        pipe->terminal_event_reason = TRANSPORT_ERROR_PIPE_TIMEOUT;
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
     /* TX_DS for close only starts the protocol-ACK wait.  If that ACK is
        absent, resend close after the peer's hardware retry window. */
     {
