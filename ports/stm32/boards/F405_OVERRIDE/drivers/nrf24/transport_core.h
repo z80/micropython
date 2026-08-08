@@ -74,6 +74,7 @@
 #define TRANSPORT_WIRE_ENUM_ASSIGN 7u
 #define TRANSPORT_WIRE_ENUM_CONFIRM 8u
 #define TRANSPORT_WIRE_CTS 9u
+#define TRANSPORT_WIRE_PIPE_CLOSE_ACK 10u
 
 typedef enum {
     TRANSPORT_REGISTRATION_FAILURE_RADIO = 1
@@ -113,7 +114,8 @@ typedef enum {
     TRANSPORT_PIPE_CTS_SENT, TRANSPORT_PIPE_OPEN, TRANSPORT_PIPE_CLOSING,
     TRANSPORT_PIPE_CLOSED, TRANSPORT_PIPE_FAILED,
     TRANSPORT_PIPE_TX_INTENT_QUEUED, TRANSPORT_PIPE_TX_WAIT_CTS,
-    TRANSPORT_PIPE_TX_OPEN, TRANSPORT_PIPE_TX_CLOSING
+    TRANSPORT_PIPE_TX_OPEN, TRANSPORT_PIPE_TX_CLOSING,
+    TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK
 } transport_pipe_state_t;
 
 typedef enum {
@@ -191,13 +193,22 @@ typedef struct {
     uint8_t peer_id;
     uint16_t session_id;
     uint32_t granted_bytes, transferred_bytes;
-    uint32_t lease_deadline_ms;
+    uint32_t lease_deadline_ms, close_retry_at_ms;
     transport_pipe_state_t state;
     transport_direction_t direction;
     bool rx_event_pending, tx_space_event_pending, credit_update_pending;
-    bool close_event_pending;
+    bool close_event_pending, close_ack_pending, close_ack_queued;
+    bool close_ack_wait_duplicate;
+    bool terminal_event_polled;
     uint32_t terminal_event_reason;
 } transport_pipe_slot_t;
+
+typedef struct {
+    uint8_t peer_id;
+    uint16_t session_id;
+    uint32_t deadline_ms;
+    bool valid, ack_pending, ack_queued, wait_duplicate;
+} transport_pipe_close_tombstone_t;
 
 typedef struct {
     transport_retry_state_t state;
@@ -265,6 +276,8 @@ typedef struct {
     transport_core_config_t config;
     transport_command_slot_t commands[TRANSPORT_CORE_COMMAND_SLOTS];
     transport_pipe_slot_t pipes[TRANSPORT_CORE_PIPE_SLOTS];
+    transport_pipe_close_tombstone_t
+        pipe_close_tombstones[TRANSPORT_CORE_PIPE_SLOTS];
     transport_ring_t control_tx;
     transport_event_descriptor_t events[TRANSPORT_CORE_EVENT_QUEUE_SIZE];
     /* Monotonic SPSC counters: IRQ/native producer writes event_write;

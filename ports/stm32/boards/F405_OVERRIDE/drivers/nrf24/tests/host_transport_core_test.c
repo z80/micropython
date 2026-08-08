@@ -189,6 +189,15 @@ static void deliver(transport_core_t *core, const uint8_t *packet) {
     transport_core_on_radio_irq(core);
 }
 
+static void deliver_close_ack(transport_core_t *core,
+        const uint8_t network[4], uint8_t source, uint8_t destination,
+        uint8_t stream_id) {
+    uint8_t packet[NRF24_MAX_PAYLOAD];
+    make_packet(packet, network, TRANSPORT_WIRE_PIPE_CLOSE_ACK, source,
+        destination, stream_id, TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+    deliver(core, packet);
+}
+
 static void ack_tx(transport_core_t *core) {
     assert(core->tx.active);
     assert(fake_tx_count != 0);
@@ -332,6 +341,9 @@ int main(void) {
     make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1, 20,
         TRANSPORT_WIRE_LAST_PACKET, first, sizeof(first));
     deliver(&core, packet);
+    assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+        TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+    ack_tx(&core);
     assert(transport_core_poll_into(&core, event_buffer, sizeof(event_buffer),
         &event_length, &required) == TRANSPORT_POLL_EVENT);
     assert(transport_event_get_type(event_buffer) == TRANSPORT_EVENT_PIPE_RX_DATA);
@@ -599,6 +611,9 @@ int main(void) {
         assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 0);
         assert((captured_tx[4] & TRANSPORT_WIRE_LAST_PACKET) != 0);
         ack_tx(&core);
+        assert(core.pipes[pipe_id].state ==
+            TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+        deliver_close_ack(&core, config.network_id, 9, 1, 40);
         assert(transport_core_poll_into(&core, event_buffer,
             sizeof(event_buffer), &event_length, &required) ==
             TRANSPORT_POLL_EVENT);
@@ -647,12 +662,27 @@ int main(void) {
         assert(captured_tx_count == writes_after_data);
         assert(core.tx.active);
         ack_tx(&core);
+        assert(fake_tx_count == 0);
+        assert(captured_tx_count == writes_after_data);
+        assert(!core.tx.active);
+
+        /* Exact credit exhaustion is a turnaround boundary: wait for the
+           receiver's replenishment before transmitting close. */
+        make_cts(packet, config.network_id, 9, 1, 47,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED,
+            2 * sizeof(outbound));
+        deliver(&core, packet);
+        assert(!core.tx.active);
+        fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
         assert(fake_tx_count == 1);
         assert(captured_tx_count == writes_after_data + 1);
         assert((captured_tx[4] & TRANSPORT_WIRE_LAST_PACKET) != 0);
         assert((captured_tx[4] & TRANSPORT_WIRE_LENGTH_MASK) == 0);
         assert(core.tx.active);
         ack_tx(&core);
+        assert(core.pipes[1].state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+        deliver_close_ack(&core, config.network_id, 9, 1, 47);
         assert(transport_core_poll_into(&core, event_buffer,
             sizeof(event_buffer), &event_length, &required) ==
             TRANSPORT_POLL_EVENT);
@@ -664,6 +694,122 @@ int main(void) {
         assert(transport_event_get_type(event_buffer) ==
             TRANSPORT_EVENT_PIPE_CLOSED);
         assert(transport_event_get_value0(event_buffer) == sizeof(outbound));
+    }
+
+    /* TX_DS for close only starts the protocol-ACK wait.  If that ACK is
+       absent, resend close after the peer's hardware retry window. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        core.config.pipe_lease_ms = 500;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 48;
+        pipe->granted_bytes = 1;
+        pipe->transferred_bytes = 0;
+        pipe->direction = TRANSPORT_DIRECTION_TX;
+        pipe->state = TRANSPORT_PIPE_TX_OPEN;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+
+        assert(transport_core_close_pipe(&core, 1));
+        assert(core.tx.kind == TRANSPORT_TX_PIPE);
+        ack_tx(&core);
+        assert(pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+        deliver_close_ack(&core, config.network_id, 9, 1, 99);
+        assert(pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+        {
+            uint8_t malformed = 1;
+            uint32_t protocol_before = core.stats.protocol_errors;
+            make_packet(packet, config.network_id,
+                TRANSPORT_WIRE_PIPE_CLOSE_ACK, 9, 1, 48,
+                TRANSPORT_WIRE_LAST_PACKET, &malformed, 1);
+            deliver(&core, packet);
+            assert(pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+            assert(core.stats.protocol_errors == protocol_before + 1);
+        }
+        fake_now += core.config.max_rt_window_ms +
+            TRANSPORT_CORE_CTS_TURNAROUND_MS - 1;
+        transport_core_service(&core);
+        assert(!core.tx.active);
+        fake_now++;
+        transport_core_service(&core);
+        assert(core.tx.kind == TRANSPORT_TX_PIPE);
+        assert((captured_tx[4] & TRANSPORT_WIRE_LAST_PACKET) != 0);
+        ack_tx(&core);
+        deliver_close_ack(&core, config.network_id, 9, 1, 48);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_CLOSED);
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
+    /* Exhausting hardware retries for a terminal close is an attempt
+       failure, not an immediate pipe failure.  The protocol deadline still
+       permits a fresh close attempt. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        core.config.pipe_lease_ms = 500;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 49;
+        pipe->granted_bytes = 1;
+        pipe->transferred_bytes = 0;
+        pipe->direction = TRANSPORT_DIRECTION_TX;
+        pipe->state = TRANSPORT_PIPE_TX_OPEN;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+
+        assert(transport_core_close_pipe(&core, 1));
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(core.tx.active);
+        fake_now += core.config.max_rt_window_ms;
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!core.tx.active);
+        assert(pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+        fake_now += core.config.max_rt_window_ms +
+            TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
+        assert(core.tx.kind == TRANSPORT_TX_PIPE);
+        ack_tx(&core);
+        deliver_close_ack(&core, config.network_id, 9, 1, 49);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_CLOSED);
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
+    /* Waiting for close confirmation remains bounded by the original close
+       lease, and timeout releases the outbound slot through a durable event. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[1];
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 9;
+        pipe->session_id = 51;
+        pipe->granted_bytes = 1;
+        pipe->transferred_bytes = 0;
+        pipe->direction = TRANSPORT_DIRECTION_TX;
+        pipe->state = TRANSPORT_PIPE_TX_OPEN;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+
+        assert(transport_core_close_pipe(&core, 1));
+        ack_tx(&core);
+        assert(pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK);
+        fake_now += core.config.pipe_lease_ms;
+        transport_core_service(&core);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(transport_event_get_value0(event_buffer) ==
+            TRANSPORT_PIPE_FAILURE_TIMEOUT);
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
     }
 
     /* A live pipe keeps the three-entry FIFO full.  A command to another
@@ -718,7 +864,15 @@ int main(void) {
         ack_tx(&core);
         assert(pipe->transferred_bytes == sizeof(long_stream));
         assert(transport_core_close_pipe(&core, 1));
+        assert(!core.tx.active);
+        make_cts(packet, config.network_id, 9, 1, 44,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED,
+            2 * sizeof(long_stream));
+        deliver(&core, packet);
+        fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
         ack_tx(&core);
+        deliver_close_ack(&core, config.network_id, 9, 1, 44);
 
         while (transport_core_poll_into(&core, event_buffer,
                 sizeof(event_buffer), &event_length, &required) ==
@@ -782,10 +936,86 @@ int main(void) {
     make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1, 43,
         TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
     deliver(&core, packet);
+    assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+        TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+    ack_tx(&core);
     assert(transport_core_poll_into(&core, event_buffer, sizeof(event_buffer),
         &event_length, &required) == TRANSPORT_POLL_EVENT);
     assert(transport_event_get_type(event_buffer) ==
         TRANSPORT_EVENT_PIPE_CLOSED);
+
+    /* A short-lived tombstone confirms a duplicate close after the original
+       event and ACK have already released the receive buffer. */
+    assert(core.pipes[0].state == TRANSPORT_PIPE_FREE);
+    make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1, 43,
+        TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+    deliver(&core, packet);
+    assert(core.tx.kind == TRANSPORT_TX_CONTROL);
+    assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+        TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+    ack_tx(&core);
+    assert(transport_core_poll_into(&core, event_buffer,
+        sizeof(event_buffer), &event_length, &required) ==
+        TRANSPORT_POLL_EMPTY);
+
+    /* A receiver retains terminal identity while its close confirmation is
+       retrying, so MAX_RT cannot strand the sender waiting for confirmation. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[0];
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        core.config.pipe_lease_ms = 500;
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 7;
+        pipe->session_id = 50;
+        pipe->direction = TRANSPORT_DIRECTION_RX;
+        pipe->state = TRANSPORT_PIPE_CLOSED;
+        pipe->close_ack_pending = true;
+        pipe->close_ack_queued = false;
+        pipe->terminal_event_polled = true;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            50, TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(core.tx.kind == TRANSPORT_TX_CONTROL);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(core.tx.active);
+        fake_now += core.config.max_rt_window_ms;
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!core.tx.active);
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            50, TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(core.tx.active);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+        ack_tx(&core);
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
+    /* If the sender disappears after an ACK failure, passive duplicate wait
+       still expires and releases the receive slot. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[0];
+        transport_ring_reset(&pipe->buffer);
+        pipe->peer_id = 7;
+        pipe->session_id = 52;
+        pipe->direction = TRANSPORT_DIRECTION_RX;
+        pipe->state = TRANSPORT_PIPE_CLOSED;
+        pipe->close_ack_pending = true;
+        pipe->close_ack_queued = false;
+        pipe->close_ack_wait_duplicate = true;
+        pipe->terminal_event_polled = true;
+        pipe->lease_deadline_ms = fake_now + core.config.pipe_lease_ms;
+        fake_now += core.config.pipe_lease_ms;
+        transport_core_service(&core);
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+    }
 
     /* A terminal RX event must survive temporary event-queue saturation.
        Once foreground polling frees one descriptor, service retries it. */
@@ -810,6 +1040,9 @@ int main(void) {
         make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
             46, TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
         deliver(&core, packet);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+        ack_tx(&core);
         assert(core.pipes[0].state == TRANSPORT_PIPE_CLOSED);
         assert(core.pipes[0].close_event_pending);
         assert(core.stats.event_queue_overflows > overflows_before);
@@ -911,8 +1144,8 @@ int main(void) {
     }
 
     assert(core.stats.pipes_opened == 5);
-    assert(core.stats.pipes_closed == 6);
-    assert(core.stats.pipes_failed == 3);
+    assert(core.stats.pipes_closed == 8);
+    assert(core.stats.pipes_failed == 4);
 
     /* A continuously supplied pipe drains at the fairness deadline, remains
        in RX for the configured dwell, and then resumes the same ring. */
@@ -952,7 +1185,15 @@ int main(void) {
         assert(pipe->transferred_bytes == sizeof(long_stream));
         assert(fake_rx_mode && !core.tx.active);
         assert(transport_core_close_pipe(&core, 1));
+        assert(!core.tx.active);
+        make_cts(packet, config.network_id, 9, 1, 45,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_ACCEPTED,
+            2 * sizeof(long_stream));
+        deliver(&core, packet);
+        fake_now += TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        transport_core_service(&core);
         ack_tx(&core);
+        deliver_close_ack(&core, config.network_id, 9, 1, 45);
         while (transport_core_poll_into(&core, event_buffer,
                 sizeof(event_buffer), &event_length, &required) ==
                 TRANSPORT_POLL_EVENT) {

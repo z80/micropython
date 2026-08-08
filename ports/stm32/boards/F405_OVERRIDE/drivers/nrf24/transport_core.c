@@ -16,8 +16,14 @@ static void core_finish_outbound_command(transport_core_t *, uint8_t, bool,
 static void core_finish_outbound_pipe(transport_core_t *, uint8_t, bool,
     uint32_t);
 static void core_finish_registration_tx(transport_core_t *, bool, uint32_t);
+static bool core_queue_packet(transport_core_t *, uint8_t, uint8_t, uint8_t,
+    uint8_t, const uint8_t *, size_t);
 static bool queue_pipe_tx_space_event(transport_core_t *, uint8_t);
 static bool core_emit_pipe_terminal(transport_core_t *, uint8_t);
+static bool core_queue_pipe_close_ack(transport_core_t *, uint8_t);
+static int core_find_pipe_close_tombstone(transport_core_t *, uint8_t,
+    uint8_t);
+static bool core_queue_tombstone_close_ack(transport_core_t *, uint8_t);
 
 static uint32_t core_now_ms(transport_core_t *core) {
     if (core->config.radio.ticks_ms == NULL) return 0;
@@ -26,6 +32,12 @@ static uint32_t core_now_ms(transport_core_t *core) {
 
 static bool core_deadline_reached(uint32_t now, uint32_t deadline) {
     return (int32_t)(now - deadline) >= 0;
+}
+
+static uint32_t core_pipe_close_retry_delay(const transport_core_t *core) {
+    uint32_t delay = core->config.max_rt_window_ms;
+    if (delay == 0) delay = 1;
+    return delay + TRANSPORT_CORE_CTS_TURNAROUND_MS;
 }
 
 static bool core_radio_io_ok(transport_core_t *core) {
@@ -248,6 +260,10 @@ static bool core_fill_tx_owner(transport_core_t *core) {
                     core->radio_phase = TRANSPORT_RADIO_TX_DRAINING;
                     break;
                 }
+                /* With an exhausted grant, the receiver may be turning
+                   around to send replenishment.  Wait for that CTS before
+                   placing the terminal packet in a new FIFO batch. */
+                if (credit == 0) break;
                 if (!core_build_packet(core, TRANSPORT_WIRE_STREAM,
                         pipe->peer_id, (uint8_t)pipe->session_id,
                         TRANSPORT_WIRE_LAST_PACKET, NULL, 0, packet) ||
@@ -338,7 +354,7 @@ static void core_tx_kick(transport_core_t *core) {
                     break;
                 }
                 if (pipe->state == TRANSPORT_PIPE_TX_CLOSING &&
-                        remaining == 0) {
+                        remaining == 0 && credit != 0) {
                     kind = TRANSPORT_TX_PIPE;
                     break;
                 }
@@ -754,11 +770,97 @@ static void core_reset_pipe(transport_pipe_slot_t *pipe) {
     pipe->granted_bytes = 0;
     pipe->transferred_bytes = 0;
     pipe->lease_deadline_ms = 0;
+    pipe->close_retry_at_ms = 0;
     pipe->rx_event_pending = false;
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
     pipe->close_event_pending = false;
+    pipe->close_ack_pending = false;
+    pipe->close_ack_queued = false;
+    pipe->close_ack_wait_duplicate = false;
+    pipe->terminal_event_polled = false;
     pipe->terminal_event_reason = 0;
+}
+
+static bool core_queue_pipe_close_ack(transport_core_t *core, uint8_t slot) {
+    transport_pipe_slot_t *pipe;
+    if (core == NULL || slot >= TRANSPORT_CORE_PIPE_SLOTS) return false;
+    pipe = &core->pipes[slot];
+    if (pipe->direction != TRANSPORT_DIRECTION_RX ||
+            pipe->state != TRANSPORT_PIPE_CLOSED ||
+            !pipe->close_ack_pending || pipe->close_ack_wait_duplicate) {
+        return false;
+    }
+    if (pipe->close_ack_queued) return true;
+    if (!core_queue_packet(core, TRANSPORT_WIRE_PIPE_CLOSE_ACK,
+            pipe->peer_id, (uint8_t)pipe->session_id,
+            TRANSPORT_WIRE_LAST_PACKET, NULL, 0)) {
+        return false;
+    }
+    pipe->close_ack_queued = true;
+    return true;
+}
+
+static int core_find_pipe_close_tombstone(transport_core_t *core,
+        uint8_t peer_id, uint8_t session_id) {
+    uint8_t i;
+    for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
+        transport_pipe_close_tombstone_t *tombstone =
+            &core->pipe_close_tombstones[i];
+        if (tombstone->valid && tombstone->peer_id == peer_id &&
+                tombstone->session_id == session_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool core_queue_tombstone_close_ack(transport_core_t *core,
+        uint8_t index) {
+    transport_pipe_close_tombstone_t *tombstone;
+    if (core == NULL || index >= TRANSPORT_CORE_PIPE_SLOTS) return false;
+    tombstone = &core->pipe_close_tombstones[index];
+    if (!tombstone->valid || !tombstone->ack_pending ||
+            tombstone->wait_duplicate) {
+        return false;
+    }
+    if (tombstone->ack_queued) return true;
+    if (!core_queue_packet(core, TRANSPORT_WIRE_PIPE_CLOSE_ACK,
+            tombstone->peer_id, (uint8_t)tombstone->session_id,
+            TRANSPORT_WIRE_LAST_PACKET, NULL, 0)) {
+        return false;
+    }
+    tombstone->ack_queued = true;
+    return true;
+}
+
+static void core_remember_closed_pipe(transport_core_t *core, uint8_t slot) {
+    transport_pipe_slot_t *pipe;
+    transport_pipe_close_tombstone_t *tombstone;
+    uint8_t target = slot;
+    uint8_t i;
+    if (core == NULL || slot >= TRANSPORT_CORE_PIPE_SLOTS) return;
+    pipe = &core->pipes[slot];
+    if (pipe->direction != TRANSPORT_DIRECTION_RX ||
+            pipe->state != TRANSPORT_PIPE_CLOSED) {
+        return;
+    }
+    for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
+        tombstone = &core->pipe_close_tombstones[i];
+        if (tombstone->valid && tombstone->peer_id == pipe->peer_id &&
+                tombstone->session_id == pipe->session_id) {
+            target = i;
+            break;
+        }
+        if (!tombstone->valid) target = i;
+    }
+    tombstone = &core->pipe_close_tombstones[target];
+    memset(tombstone, 0, sizeof(*tombstone));
+    tombstone->valid = true;
+    tombstone->peer_id = pipe->peer_id;
+    tombstone->session_id = pipe->session_id;
+    tombstone->deadline_ms = core->config.pipe_lease_ms != 0 ?
+        core_now_ms(core) + core->config.pipe_lease_ms : 0;
 }
 
 static void core_finish_outbound_pipe(transport_core_t *core, uint8_t slot,
@@ -918,6 +1020,11 @@ int transport_core_open_pipe(transport_core_t *core, uint8_t destination_id,
             pipe->tx_space_event_pending = false;
             pipe->credit_update_pending = false;
             pipe->close_event_pending = false;
+            pipe->close_ack_pending = false;
+            pipe->close_ack_queued = false;
+            pipe->close_ack_wait_duplicate = false;
+            pipe->terminal_event_polled = false;
+            pipe->close_retry_at_ms = 0;
             pipe->terminal_event_reason = 0;
             break;
         }
@@ -1069,7 +1176,8 @@ static int core_find_pipe_slot(transport_core_t *core, uint8_t source_id,
         transport_pipe_slot_t *pipe = &core->pipes[i];
         if (pipe->direction == TRANSPORT_DIRECTION_RX &&
                 (pipe->state == TRANSPORT_PIPE_CTS_SENT ||
-                 pipe->state == TRANSPORT_PIPE_OPEN) &&
+                 pipe->state == TRANSPORT_PIPE_OPEN ||
+                 pipe->state == TRANSPORT_PIPE_CLOSED) &&
                 pipe->peer_id == source_id &&
                 pipe->session_id == stream_id) {
             return i;
@@ -1084,15 +1192,26 @@ static int core_find_pipe_slot(transport_core_t *core, uint8_t source_id,
 static void core_receive_pipe_intent(transport_core_t *core,
         uint8_t source_id, uint8_t stream_id, size_t payload_length) {
     int slot;
+    int tombstone;
     transport_pipe_slot_t *pipe;
     if (payload_length != 0) {
         (void)core_queue_cts(core, source_id, stream_id, TRANSPORT_WIRE_STREAM,
             TRANSPORT_CTS_INVALID, 0);
         return;
     }
+    tombstone = core_find_pipe_close_tombstone(core, source_id, stream_id);
+    if (tombstone >= 0) {
+        memset(&core->pipe_close_tombstones[tombstone], 0,
+            sizeof(core->pipe_close_tombstones[tombstone]));
+    }
     slot = core_find_pipe_slot(core, source_id, stream_id, false);
     if (slot >= 0) {
         pipe = &core->pipes[slot];
+        if (pipe->state == TRANSPORT_PIPE_CLOSED) {
+            pipe->close_ack_pending = true;
+            (void)core_queue_pipe_close_ack(core, (uint8_t)slot);
+            return;
+        }
         (void)core_queue_cts(core, source_id, stream_id, TRANSPORT_WIRE_STREAM,
             TRANSPORT_CTS_ACCEPTED, pipe->granted_bytes);
         return;
@@ -1119,6 +1238,11 @@ static void core_receive_pipe_intent(transport_core_t *core,
     pipe->tx_space_event_pending = false;
     pipe->credit_update_pending = false;
     pipe->close_event_pending = false;
+    pipe->close_ack_pending = false;
+    pipe->close_ack_queued = false;
+    pipe->close_ack_wait_duplicate = false;
+    pipe->terminal_event_polled = false;
+    pipe->close_retry_at_ms = 0;
     pipe->terminal_event_reason = 0;
     pipe->lease_deadline_ms = core_now_ms(core) + core->config.pipe_lease_ms;
     if (!core_queue_cts(core, source_id, stream_id, TRANSPORT_WIRE_STREAM,
@@ -1137,6 +1261,27 @@ static void core_control_acked(transport_core_t *core, const uint8_t *packet) {
     packet_type = packet[0] & TRANSPORT_WIRE_TYPE_MASK;
     peer_id = packet[2];
     message_id = packet[3];
+    if (packet_type == TRANSPORT_WIRE_PIPE_CLOSE_ACK) {
+        slot = core_find_pipe_slot(core, peer_id, message_id, false);
+        if (slot >= 0 && core->pipes[slot].direction == TRANSPORT_DIRECTION_RX &&
+                core->pipes[slot].state == TRANSPORT_PIPE_CLOSED) {
+            core->pipes[slot].close_ack_pending = false;
+            core->pipes[slot].close_ack_queued = false;
+            core->pipes[slot].close_ack_wait_duplicate = false;
+            if (core->pipes[slot].terminal_event_polled) {
+                core_remember_closed_pipe(core, (uint8_t)slot);
+                core_reset_pipe(&core->pipes[slot]);
+            }
+        } else {
+            slot = core_find_pipe_close_tombstone(core, peer_id, message_id);
+            if (slot >= 0) {
+                core->pipe_close_tombstones[slot].ack_pending = false;
+                core->pipe_close_tombstones[slot].ack_queued = false;
+                core->pipe_close_tombstones[slot].wait_duplicate = false;
+            }
+        }
+        return;
+    }
     if (core_is_command_type(packet_type) &&
             (packet[4] & TRANSPORT_WIRE_INTENT) != 0) {
         slot = core_find_outbound_command(core, packet_type, peer_id,
@@ -1206,6 +1351,21 @@ static void core_control_failed(transport_core_t *core,
     packet_type = packet[0] & TRANSPORT_WIRE_TYPE_MASK;
     peer_id = packet[2];
     message_id = packet[3];
+    if (packet_type == TRANSPORT_WIRE_PIPE_CLOSE_ACK) {
+        slot = core_find_pipe_slot(core, peer_id, message_id, false);
+        if (slot >= 0 && core->pipes[slot].direction == TRANSPORT_DIRECTION_RX &&
+                core->pipes[slot].state == TRANSPORT_PIPE_CLOSED) {
+            core->pipes[slot].close_ack_queued = false;
+            core->pipes[slot].close_ack_wait_duplicate = true;
+        } else {
+            slot = core_find_pipe_close_tombstone(core, peer_id, message_id);
+            if (slot >= 0) {
+                core->pipe_close_tombstones[slot].ack_queued = false;
+                core->pipe_close_tombstones[slot].wait_duplicate = true;
+            }
+        }
+        return;
+    }
     if (core_is_command_type(packet_type) &&
             (packet[4] & TRANSPORT_WIRE_INTENT) != 0) {
         slot = core_find_outbound_command(core, packet_type, peer_id,
@@ -1343,11 +1503,36 @@ static void core_receive_pipe_fragment(transport_core_t *core,
     int slot = core_find_pipe_slot(core, source_id, stream_id, false);
     transport_pipe_slot_t *pipe;
     if (slot < 0) {
+        int tombstone = core_find_pipe_close_tombstone(core, source_id,
+            stream_id);
+        if (tombstone >= 0 && last_packet && payload_length == 0) {
+            transport_pipe_close_tombstone_t *closed =
+                &core->pipe_close_tombstones[tombstone];
+            closed->ack_pending = true;
+            closed->wait_duplicate = false;
+            closed->deadline_ms = core->config.pipe_lease_ms != 0 ?
+                core_now_ms(core) + core->config.pipe_lease_ms : 0;
+            (void)core_queue_tombstone_close_ack(core, (uint8_t)tombstone);
+            return;
+        }
         transport_core_report_error(core, TRANSPORT_ERROR_PROTOCOL,
             TRANSPORT_CORE_INVALID_ID, stream_id);
         return;
     }
     pipe = &core->pipes[slot];
+    if (pipe->state == TRANSPORT_PIPE_CLOSED) {
+        if (last_packet && payload_length == 0) {
+            pipe->close_ack_pending = true;
+            pipe->close_ack_wait_duplicate = false;
+            pipe->lease_deadline_ms = core->config.pipe_lease_ms != 0 ?
+                core_now_ms(core) + core->config.pipe_lease_ms : 0;
+            (void)core_queue_pipe_close_ack(core, (uint8_t)slot);
+        } else {
+            transport_core_report_error(core, TRANSPORT_ERROR_PROTOCOL,
+                (uint8_t)slot, stream_id);
+        }
+        return;
+    }
     pipe->state = TRANSPORT_PIPE_OPEN;
     pipe->lease_deadline_ms = core_now_ms(core) + core->config.pipe_lease_ms;
     if ((uint32_t)payload_length >
@@ -1379,11 +1564,32 @@ static void core_receive_pipe_fragment(transport_core_t *core,
     }
     if (last_packet) {
         pipe->state = TRANSPORT_PIPE_CLOSED;
+        pipe->close_ack_pending = true;
+        pipe->close_ack_queued = false;
+        pipe->close_ack_wait_duplicate = false;
+        pipe->terminal_event_polled = false;
         pipe->close_event_pending = true;
         pipe->terminal_event_reason = 0;
         core->stats.pipes_closed++;
+        (void)core_queue_pipe_close_ack(core, (uint8_t)slot);
         (void)core_emit_pipe_terminal(core, (uint8_t)slot);
     }
+}
+
+static void core_receive_pipe_close_ack(transport_core_t *core,
+        uint8_t source_id, uint8_t stream_id, size_t payload_length,
+        bool last_packet) {
+    int slot;
+    transport_pipe_slot_t *pipe;
+    if (!last_packet || payload_length != 0) {
+        core->stats.protocol_errors++;
+        return;
+    }
+    slot = core_find_outbound_pipe(core, source_id, stream_id);
+    if (slot < 0) return;
+    pipe = &core->pipes[slot];
+    if (pipe->state != TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK) return;
+    core_finish_outbound_pipe(core, (uint8_t)slot, true, 0);
 }
 
 static void core_receive_packet(transport_core_t *core, const uint8_t *packet,
@@ -1446,6 +1652,9 @@ static void core_receive_packet(transport_core_t *core, const uint8_t *packet,
     if (message_type == TRANSPORT_WIRE_CTS && !intent) {
         core_receive_cts(core, source_id, message_id,
             packet + TRANSPORT_WIRE_HEADER_SIZE, payload_length, last_packet);
+    } else if (message_type == TRANSPORT_WIRE_PIPE_CLOSE_ACK && !intent) {
+        core_receive_pipe_close_ack(core, source_id, message_id,
+            payload_length, last_packet);
     } else if (core_is_command_type(message_type) && intent) {
         core_receive_command_intent(core, message_type, source_id, message_id,
             packet + TRANSPORT_WIRE_HEADER_SIZE, payload_length);
@@ -1619,6 +1828,8 @@ void transport_core_stop(transport_core_t *core) {
     for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
         core_reset_pipe(&core->pipes[i]);
     }
+    memset(core->pipe_close_tombstones, 0,
+        sizeof(core->pipe_close_tombstones));
     transport_ring_reset(&core->control_tx);
     core_exit(core, critical);
 }
@@ -1698,6 +1909,7 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                     NRF24_STATUS_MAX_RT | NRF24_STATUS_TX_DS);
                 nrf24_set_ce(radio, true);
             } else {
+                bool retry_pipe_close = false;
                 core->retry.state = TRANSPORT_RETRY_EXHAUSTED;
                 nrf24_abort_send(radio);
                 if (core->tx.active) {
@@ -1706,6 +1918,10 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                         if (transport_ring_peek(&core->control_tx, packet,
                                 sizeof(packet)) == sizeof(packet)) {
                             core_control_failed(core, packet);
+                            if ((packet[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+                                    TRANSPORT_WIRE_PIPE_CLOSE_ACK) {
+                                retry_pipe_close = true;
+                            }
                         }
                         (void)transport_ring_discard(&core->control_tx,
                             TRANSPORT_CONTROL_RECORD_SIZE);
@@ -1719,13 +1935,26 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                             false, TRANSPORT_COMMAND_FAILURE_RADIO);
                     } else if (core->tx.kind == TRANSPORT_TX_PIPE &&
                             core->tx.slot < TRANSPORT_CORE_PIPE_SLOTS) {
-                        core_finish_outbound_pipe(core, core->tx.slot, false,
-                            TRANSPORT_PIPE_FAILURE_RADIO);
+                        transport_pipe_slot_t *pipe =
+                            &core->pipes[core->tx.slot];
+                        if (pipe->state == TRANSPORT_PIPE_TX_CLOSING &&
+                                core->tx.last_packet &&
+                                core->tx.staged_payload_bytes == 0) {
+                            pipe->state = TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK;
+                            pipe->close_retry_at_ms = now +
+                                core_pipe_close_retry_delay(core);
+                            retry_pipe_close = true;
+                        } else {
+                            core_finish_outbound_pipe(core, core->tx.slot,
+                                false, TRANSPORT_PIPE_FAILURE_RADIO);
+                        }
                     }
                     core_release_tx_owner(core);
                 }
-                transport_core_report_error(core, TRANSPORT_ERROR_RADIO,
-                    TRANSPORT_CORE_INVALID_ID, NRF24_STATUS_MAX_RT);
+                if (!retry_pipe_close) {
+                    transport_core_report_error(core, TRANSPORT_ERROR_RADIO,
+                        TRANSPORT_CORE_INVALID_ID, NRF24_STATUS_MAX_RT);
+                }
                 core_tx_kick(core);
                 if (!core->tx.active) core_restore_rx(core);
             }
@@ -1775,7 +2004,9 @@ void transport_core_on_radio_irq(transport_core_t *core) {
                             slot < TRANSPORT_CORE_PIPE_SLOTS) {
                         transport_pipe_slot_t *pipe = &core->pipes[slot];
                         if (last_packet) {
-                            core_finish_outbound_pipe(core, slot, true, 0);
+                            pipe->state = TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK;
+                            pipe->close_retry_at_ms = now +
+                                core_pipe_close_retry_delay(core);
                         } else if (core->config.pipe_lease_ms != 0) {
                             pipe->lease_deadline_ms = now +
                                 core->config.pipe_lease_ms;
@@ -1881,6 +2112,18 @@ void transport_core_service(transport_core_t *core) {
     }
     for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
         transport_pipe_slot_t *pipe = &core->pipes[i];
+        if (pipe->direction == TRANSPORT_DIRECTION_RX &&
+                pipe->state == TRANSPORT_PIPE_CLOSED &&
+                pipe->close_ack_pending) {
+            if (core->config.pipe_lease_ms != 0 &&
+                    core_deadline_reached(now, pipe->lease_deadline_ms)) {
+                pipe->close_ack_pending = false;
+                if (pipe->terminal_event_polled) core_reset_pipe(pipe);
+            } else if (!pipe->close_ack_queued &&
+                    !pipe->close_ack_wait_duplicate) {
+                (void)core_queue_pipe_close_ack(core, i);
+            }
+        }
         if ((pipe->state == TRANSPORT_PIPE_CLOSED ||
                 pipe->state == TRANSPORT_PIPE_FAILED) &&
                 pipe->close_event_pending) {
@@ -1901,7 +2144,8 @@ void transport_core_service(transport_core_t *core) {
                 pipe->direction == TRANSPORT_DIRECTION_TX &&
                 (pipe->state == TRANSPORT_PIPE_TX_WAIT_CTS ||
                  pipe->state == TRANSPORT_PIPE_TX_CLOSING ||
-                 pipe->state == TRANSPORT_PIPE_TX_OPEN) &&
+                 pipe->state == TRANSPORT_PIPE_TX_OPEN ||
+                 pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK) &&
                 core_deadline_reached(now, pipe->lease_deadline_ms)) {
             if (core->tx.active && core->tx.kind == TRANSPORT_TX_PIPE &&
                     core->tx.slot == i) {
@@ -1913,8 +2157,24 @@ void transport_core_service(transport_core_t *core) {
             core_finish_outbound_pipe(core, i, false,
                 TRANSPORT_PIPE_FAILURE_TIMEOUT);
             core_restore_rx(core);
+        } else if (pipe->direction == TRANSPORT_DIRECTION_TX &&
+                pipe->state == TRANSPORT_PIPE_TX_WAIT_CLOSE_ACK &&
+                core_deadline_reached(now, pipe->close_retry_at_ms)) {
+            pipe->state = TRANSPORT_PIPE_TX_CLOSING;
         } else {
             core_maybe_queue_rx_credit(core, i);
+        }
+    }
+    for (i = 0; i < TRANSPORT_CORE_PIPE_SLOTS; ++i) {
+        transport_pipe_close_tombstone_t *tombstone =
+            &core->pipe_close_tombstones[i];
+        if (!tombstone->valid) continue;
+        if (core->config.pipe_lease_ms != 0 &&
+                core_deadline_reached(now, tombstone->deadline_ms)) {
+            memset(tombstone, 0, sizeof(*tombstone));
+        } else if (tombstone->ack_pending && !tombstone->ack_queued &&
+                !tombstone->wait_duplicate) {
+            (void)core_queue_tombstone_close_ack(core, i);
         }
     }
     core_tx_kick(core);
@@ -2182,7 +2442,18 @@ transport_poll_result_t transport_core_poll_into(transport_core_t *core,
     if ((fields.type == TRANSPORT_EVENT_PIPE_FAILED ||
          fields.type == TRANSPORT_EVENT_PIPE_CLOSED) &&
             fields.object_id < TRANSPORT_CORE_PIPE_SLOTS) {
-        core_reset_pipe(&core->pipes[fields.object_id]);
+        transport_pipe_slot_t *pipe = &core->pipes[fields.object_id];
+        if (fields.type == TRANSPORT_EVENT_PIPE_CLOSED &&
+                pipe->direction == TRANSPORT_DIRECTION_RX &&
+                pipe->close_ack_pending) {
+            pipe->terminal_event_polled = true;
+        } else {
+            if (fields.type == TRANSPORT_EVENT_PIPE_CLOSED &&
+                    pipe->direction == TRANSPORT_DIRECTION_RX) {
+                core_remember_closed_pipe(core, fields.object_id);
+            }
+            core_reset_pipe(pipe);
+        }
     }
     core_tx_kick(core);
     core->stats.events_polled++;
