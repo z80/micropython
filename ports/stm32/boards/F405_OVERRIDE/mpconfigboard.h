@@ -126,3 +126,6 @@ extern struct _spi_bdev_t spi_bdev;
 
 #endif
 
+// Stop board-specific ADC DMA before generic timer teardown and GC sweep.
+#define MICROPY_BOARD_START_SOFT_RESET F405_OVERRIDE_board_start_soft_reset
+void F405_OVERRIDE_board_start_soft_reset(void *state);

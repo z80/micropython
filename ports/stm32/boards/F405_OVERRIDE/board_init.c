@@ -1,6 +1,8 @@
 #include "mpconfigboard.h"
 #include "py/mphal.h"
+#include "boardctrl.h"
 #include "spi.h"
+#include "adc_stream_stm32.h"
 
 const spi_t *spi2 = &spi_obj[1];
 
@@ -34,3 +36,7 @@ void F405_SERGEY_V2_board_early_init(void) {
     }*/
 }
 
+void F405_OVERRIDE_board_start_soft_reset(void *state_in) {
+    adc_stream_deinit_all();
+    boardctrl_start_soft_reset((boardctrl_state_t *)state_in);
+}

@@ -38,6 +38,10 @@ typedef struct _dma_descr_t dma_descr_t;
 
 #if defined(STM32F0) || defined(STM32F4) || defined(STM32F7) || defined(STM32G0) || defined(STM32H5) || defined(STM32H7) || defined(STM32U5)
 
+#if defined(STM32F4)
+extern const dma_descr_t dma_ADC_1_RX;
+#endif
+
 extern const dma_descr_t dma_I2C_1_RX;
 extern const dma_descr_t dma_SPI_3_RX;
 extern const dma_descr_t dma_I2C_4_RX;

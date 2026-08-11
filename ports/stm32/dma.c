@@ -132,6 +132,24 @@ static const DMA_InitTypeDef dma_init_struct_spi_i2c = {
 };
 #endif
 
+#if defined(STM32F4)
+// ADC1 on STM32F4 uses 16-bit peripheral-to-memory transfers in circular mode.
+static const DMA_InitTypeDef dma_init_struct_adc = {
+    .Channel = 0,
+    .Direction = DMA_PERIPH_TO_MEMORY,
+    .PeriphInc = DMA_PINC_DISABLE,
+    .MemInc = DMA_MINC_ENABLE,
+    .PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD,
+    .MemDataAlignment = DMA_MDATAALIGN_HALFWORD,
+    .Mode = DMA_CIRCULAR,
+    .Priority = DMA_PRIORITY_HIGH,
+    .FIFOMode = DMA_FIFOMODE_DISABLE,
+    .FIFOThreshold = DMA_FIFO_THRESHOLD_FULL,
+    .MemBurst = DMA_MBURST_SINGLE,
+    .PeriphBurst = DMA_PBURST_SINGLE,
+};
+#endif
+
 #if MICROPY_PY_MACHINE_I2S
 // Default parameters to dma_init() for i2s; Channel and Direction
 // vary depending on the peripheral instance so they get passed separately
@@ -336,6 +354,9 @@ const dma_descr_t dma_I2C_1_TX = { DMA1_Stream6, DMA_CHANNEL_1, dma_id_6,   &dma
 */
 
 // DMA2 streams
+#if defined(STM32F4)
+const dma_descr_t dma_ADC_1_RX = { DMA2_Stream0, DMA_CHANNEL_0, dma_id_8, &dma_init_struct_adc };
+#endif
 #if defined(STM32F7) && defined(SDMMC2) && ENABLE_SDIO
 const dma_descr_t dma_SDMMC_2 = { DMA2_Stream0, DMA_CHANNEL_11, dma_id_8,  &dma_init_struct_sdio };
 #endif
