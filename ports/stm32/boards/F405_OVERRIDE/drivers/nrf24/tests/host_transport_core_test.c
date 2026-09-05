@@ -1450,6 +1450,183 @@ int main(void) {
         assert(core.pipes[1].state == TRANSPORT_PIPE_FREE);
     }
 
+    /* MAX_RT on the initial CTS is ambiguous: the sender may have received
+       the grant even though its hardware ACK was lost.  Preserve the RX
+       reservation and let the first valid fragment prove that the pipe is
+       open.  The open event must be emitted exactly once. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[0];
+        unsigned open_events = 0;
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            70, TRANSPORT_WIRE_INTENT | TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(pipe->state == TRANSPORT_PIPE_CTS_SENT);
+        for (i = 0; i < config.max_rt_restarts; ++i) {
+            fake_status |= NRF24_STATUS_MAX_RT;
+            transport_core_on_radio_irq(&core);
+            assert(core.tx.active);
+        }
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!core.tx.active);
+        assert(pipe->state == TRANSPORT_PIPE_CTS_SENT);
+
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            70, 0, first, sizeof(first));
+        deliver(&core, packet);
+        assert(pipe->state == TRANSPORT_PIPE_OPEN);
+        while (transport_core_poll_into(&core, event_buffer,
+                sizeof(event_buffer), &event_length, &required) ==
+                TRANSPORT_POLL_EVENT) {
+            if (transport_event_get_type(event_buffer) ==
+                    TRANSPORT_EVENT_PIPE_OPENED) {
+                open_events++;
+            }
+        }
+        assert(open_events == 1);
+
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            70, TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_PIPE_CLOSE_ACK);
+        ack_tx(&core);
+        while (transport_core_poll_into(&core, event_buffer,
+                sizeof(event_buffer), &event_length, &required) ==
+                TRANSPORT_POLL_EVENT) {
+            assert(transport_event_get_type(event_buffer) !=
+                TRANSPORT_EVENT_PIPE_OPENED);
+        }
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+    }
+
+    /* If the initial CTS was genuinely lost, a duplicate stream intent must
+       reuse the existing RX reservation and repeat the same cumulative grant.
+       Neither the duplicate intent nor a later duplicate may emit a second
+       open event. */
+    {
+        transport_pipe_slot_t *pipe = &core.pipes[0];
+        uint32_t initial_grant;
+        unsigned open_events = 0;
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            71, TRANSPORT_WIRE_INTENT | TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        initial_grant = pipe->granted_bytes;
+        for (i = 0; i < config.max_rt_restarts; ++i) {
+            fake_status |= NRF24_STATUS_MAX_RT;
+            transport_core_on_radio_irq(&core);
+        }
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(pipe->state == TRANSPORT_PIPE_CTS_SENT);
+
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            71, TRANSPORT_WIRE_INTENT | TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(pipe->state == TRANSPORT_PIPE_CTS_SENT);
+        assert(core.pipes[1].state == TRANSPORT_PIPE_FREE);
+        assert(pipe->granted_bytes == initial_grant);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_CTS);
+        assert(captured_tx[TRANSPORT_WIRE_HEADER_SIZE + 2] ==
+            (uint8_t)initial_grant);
+        ack_tx(&core);
+        assert(pipe->state == TRANSPORT_PIPE_OPEN);
+
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            71, TRANSPORT_WIRE_INTENT | TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        assert(pipe->state == TRANSPORT_PIPE_OPEN);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_CTS);
+        ack_tx(&core);
+        while (transport_core_poll_into(&core, event_buffer,
+                sizeof(event_buffer), &event_length, &required) ==
+                TRANSPORT_POLL_EVENT) {
+            if (transport_event_get_type(event_buffer) ==
+                    TRANSPORT_EVENT_PIPE_OPENED) {
+                open_events++;
+            }
+        }
+        assert(open_events == 1);
+
+        make_packet(packet, config.network_id, TRANSPORT_WIRE_STREAM, 7, 1,
+            71, TRANSPORT_WIRE_LAST_PACKET, NULL, 0);
+        deliver(&core, packet);
+        ack_tx(&core);
+        while (transport_core_poll_into(&core, event_buffer,
+                sizeof(event_buffer), &event_length, &required) ==
+                TRANSPORT_POLL_EVENT) {
+        }
+        assert(pipe->state == TRANSPORT_PIPE_FREE);
+    }
+
+    /* An outbound opening intent is idempotently repeated after terminal
+       MAX_RT, but its original pipe lease remains the hard deadline.  Lease
+       expiry must release the control TX owner and permit a subsequent open. */
+    {
+        uint16_t saved_lease = core.config.pipe_lease_ms;
+        uint32_t retry_delay = core.config.max_rt_window_ms +
+            TRANSPORT_CORE_CTS_TURNAROUND_MS;
+        uint32_t original_deadline;
+        int pipe_id;
+        core.config.pipe_lease_ms = 500;
+        pipe_id = transport_core_open_pipe(&core, 9, 72);
+        assert(pipe_id == 0);
+        original_deadline = core.pipes[pipe_id].lease_deadline_ms;
+        assert(original_deadline == fake_now + core.config.pipe_lease_ms);
+        for (i = 0; i < config.max_rt_restarts; ++i) {
+            fake_status |= NRF24_STATUS_MAX_RT;
+            transport_core_on_radio_irq(&core);
+        }
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(!core.tx.active);
+        assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_TX_WAIT_CTS);
+        assert(core.pipes[pipe_id].lease_deadline_ms == original_deadline);
+
+        fake_now += retry_delay;
+        transport_core_service(&core);
+        assert(core.tx.active && core.tx.kind == TRANSPORT_TX_CONTROL);
+        assert((captured_tx[0] & TRANSPORT_WIRE_TYPE_MASK) ==
+            TRANSPORT_WIRE_STREAM);
+        assert((captured_tx[4] & TRANSPORT_WIRE_INTENT) != 0);
+        for (i = 0; i < config.max_rt_restarts; ++i) {
+            fake_status |= NRF24_STATUS_MAX_RT;
+            transport_core_on_radio_irq(&core);
+        }
+        fake_status |= NRF24_STATUS_MAX_RT;
+        transport_core_on_radio_irq(&core);
+        assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_TX_WAIT_CTS);
+        assert(core.pipes[pipe_id].lease_deadline_ms == original_deadline);
+
+        fake_now = original_deadline;
+        transport_core_service(&core);
+        assert(!core.tx.active);
+        assert(fake_rx_mode);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(transport_event_get_value0(event_buffer) ==
+            TRANSPORT_PIPE_FAILURE_TIMEOUT);
+        assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_FREE);
+
+        assert(transport_core_open_pipe(&core, 9, 73) == pipe_id);
+        ack_tx(&core);
+        make_cts(packet, config.network_id, 9, 1, 73,
+            TRANSPORT_WIRE_STREAM, TRANSPORT_CTS_BUSY, 0);
+        deliver(&core, packet);
+        assert(transport_core_poll_into(&core, event_buffer,
+            sizeof(event_buffer), &event_length, &required) ==
+            TRANSPORT_POLL_EVENT);
+        assert(transport_event_get_type(event_buffer) ==
+            TRANSPORT_EVENT_PIPE_FAILED);
+        assert(core.pipes[pipe_id].state == TRANSPORT_PIPE_FREE);
+        core.config.pipe_lease_ms = saved_lease;
+    }
+
     /* Registration datagrams use explicit RF addresses while preserving the
        logical source/destination fields used by Python registration policy. */
     {
